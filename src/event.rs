@@ -27,6 +27,16 @@ pub enum RunEvent {
         result: Value,
         is_error: bool,
     },
+    HandoffStarted {
+        call_id: String,
+        agent: String,
+    },
+    HandoffCompleted {
+        call_id: String,
+        agent: String,
+        child_run_id: Option<Uuid>,
+        is_error: bool,
+    },
     Completed {
         run_id: Uuid,
         turns: usize,

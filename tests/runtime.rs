@@ -181,3 +181,58 @@ async fn supports_cancellation() {
 
     assert!(matches!(error, AgentError::Cancelled));
 }
+
+#[tokio::test]
+async fn hands_a_task_to_a_named_agent_and_returns_the_result_to_the_parent() {
+    let child_model = Arc::new(ScriptedModel::new([ModelResponse::new(
+        Message::assistant("42"),
+    )]));
+    let child = Agent::new(child_model)
+        .name("math")
+        .description("Solve arithmetic tasks")
+        .instruction("Return only the answer.");
+
+    let parent_model = Arc::new(ScriptedModel::new([
+        ModelResponse::new(Message::new(
+            Role::Assistant,
+            vec![Content::ToolCall {
+                id: "handoff-1".into(),
+                name: "handoff_to_math".into(),
+                arguments: json!({ "task": "Calculate 20 + 22" }),
+            }],
+        )),
+        ModelResponse::new(Message::assistant("The math agent returned 42.")),
+    ]));
+    let parent = Agent::new(parent_model.clone()).handoff([child]);
+
+    let output = parent.run("What is 20 + 22?").await.unwrap();
+
+    assert_eq!(output.final_text, "The math agent returned 42.");
+    assert_eq!(output.tool_calls, 1);
+    let requests = parent_model.requests.lock().unwrap();
+    assert_eq!(requests[0].tools[0].name, "handoff_to_math");
+    assert_eq!(
+        requests[0].tools[0].input_schema["required"],
+        json!(["task"])
+    );
+    assert_eq!(
+        requests[1].messages.last().unwrap().content,
+        vec![Content::ToolResult {
+            call_id: "handoff-1".into(),
+            result: json!({ "agent": "math", "response": "42" }),
+            is_error: false,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn rejects_an_unnamed_handoff_agent_before_calling_the_model() {
+    let child = Agent::new(Arc::new(ScriptedModel::new(Vec::<ModelResponse>::new())));
+    let parent_model = Arc::new(ScriptedModel::new(Vec::<ModelResponse>::new()));
+    let parent = Agent::new(parent_model.clone()).handoff([child]);
+
+    let error = parent.run("route this").await.unwrap_err();
+
+    assert!(matches!(error, AgentError::InvalidConfiguration(_)));
+    assert!(parent_model.requests.lock().unwrap().is_empty());
+}

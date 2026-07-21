@@ -46,6 +46,7 @@ impl Runtime {
     }
 
     pub async fn run(&self, agent: &Agent, request: RunRequest) -> Result<RunOutput, AgentError> {
+        agent.validate()?;
         let cancellation_token = request.cancellation_token.clone();
         tokio::select! {
             _ = cancellation_token.cancelled() => {
@@ -164,6 +165,99 @@ impl Runtime {
 
             for (call_id, name, arguments) in calls {
                 tool_calls += 1;
+                if let Some(child) = agent.handoff_by_tool_name(&name) {
+                    let Some(task) = arguments.get("task").and_then(Value::as_str) else {
+                        let result =
+                            json!({ "error": "handoff requires a string `task` argument" });
+                        emit_handoff_result(
+                            agent,
+                            &call_id,
+                            child.display_name(),
+                            None,
+                            result,
+                            true,
+                            &mut request.messages,
+                        )
+                        .await;
+                        continue;
+                    };
+
+                    tracing::info!(
+                        %run_id,
+                        %call_id,
+                        agent = child.display_name(),
+                        "handoff started"
+                    );
+                    tracing::debug!(
+                        %run_id,
+                        %call_id,
+                        agent = child.display_name(),
+                        task,
+                        "handoff task"
+                    );
+                    agent
+                        .event_sink
+                        .emit(RunEvent::HandoffStarted {
+                            call_id: call_id.clone(),
+                            agent: child.display_name().into(),
+                        })
+                        .await;
+
+                    let child_request = RunRequest::new(child.prompt_messages(task.into()))
+                        .with_cancellation_token(request.cancellation_token.clone());
+                    match Box::pin(self.run(child, child_request)).await {
+                        Ok(output) => {
+                            usage.add(output.usage);
+                            tracing::info!(
+                                %run_id,
+                                %call_id,
+                                child_run_id = %output.run_id,
+                                agent = child.display_name(),
+                                "handoff completed"
+                            );
+                            let result = json!({
+                                "agent": child.display_name(),
+                                "response": output.final_text
+                            });
+                            emit_handoff_result(
+                                agent,
+                                &call_id,
+                                child.display_name(),
+                                Some(output.run_id),
+                                result,
+                                false,
+                                &mut request.messages,
+                            )
+                            .await;
+                        }
+                        Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
+                        Err(error) => {
+                            tracing::warn!(
+                                %run_id,
+                                %call_id,
+                                agent = child.display_name(),
+                                error = %error,
+                                "handoff failed"
+                            );
+                            let result = json!({
+                                "agent": child.display_name(),
+                                "error": error.to_string()
+                            });
+                            emit_handoff_result(
+                                agent,
+                                &call_id,
+                                child.display_name(),
+                                None,
+                                result,
+                                true,
+                                &mut request.messages,
+                            )
+                            .await;
+                        }
+                    }
+                    continue;
+                }
+
                 let Some(tool) = agent.tools.get(&name) else {
                     tracing::warn!(%run_id, %call_id, tool = %name, "model requested unknown tool");
                     let result = json!({ "error": format!("unknown tool: {name}") });
@@ -247,6 +341,32 @@ async fn emit_tool_result(
             is_error,
         })
         .await;
+    push_tool_result(call_id, result, is_error, messages);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_handoff_result(
+    agent: &Agent,
+    call_id: &str,
+    child_name: &str,
+    child_run_id: Option<Uuid>,
+    result: Value,
+    is_error: bool,
+    messages: &mut Vec<Message>,
+) {
+    agent
+        .event_sink
+        .emit(RunEvent::HandoffCompleted {
+            call_id: call_id.to_owned(),
+            agent: child_name.to_owned(),
+            child_run_id,
+            is_error,
+        })
+        .await;
+    push_tool_result(call_id, result, is_error, messages);
+}
+
+fn push_tool_result(call_id: &str, result: Value, is_error: bool, messages: &mut Vec<Message>) {
     messages.push(Message::new(
         Role::Tool,
         vec![Content::ToolResult {

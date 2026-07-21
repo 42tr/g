@@ -67,6 +67,8 @@ pub enum AgentError {
     InvalidModelResponse(crate::Role),
     #[error("duplicate tool name: {0}")]
     DuplicateTool(String),
+    #[error("invalid agent configuration: {0}")]
+    InvalidConfiguration(String),
     #[error("maximum number of turns exceeded ({0})")]
     MaxTurnsExceeded(usize),
     #[error("maximum number of tool calls exceeded ({0})")]
