@@ -216,8 +216,9 @@ impl Runtime {
 
                     let mut child_agent = child.as_ref().clone();
                     child_agent.event_sink = agent.event_sink.clone();
-                    let child_request = RunRequest::new(child_agent.prompt_messages(task.into()))
-                        .with_cancellation_token(request.cancellation_token.clone());
+                    let child_request =
+                        RunRequest::new(child_agent.prompt_messages(Message::user(task)))
+                            .with_cancellation_token(request.cancellation_token.clone());
                     match Box::pin(self.run(&child_agent, child_request)).await {
                         Ok(output) => {
                             usage.add(output.usage);

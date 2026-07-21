@@ -1,8 +1,8 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crate::{
-    AgentError, AllowAll, EventSink, IntoTool, Message, Model, NoopEventSink, Policy, RunEvent,
-    RunOutput, RunRequest, Runtime, Tool, ToolBehavior, ToolSpec,
+    AgentError, AllowAll, EventSink, IntoPrompt, IntoTool, Message, Model, NoopEventSink, Policy,
+    RunEvent, RunOutput, RunRequest, Runtime, Tool, ToolBehavior, ToolSpec,
 };
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -147,15 +147,18 @@ impl Agent {
         specs
     }
 
-    pub async fn run(&self, prompt: impl Into<String>) -> Result<RunOutput, AgentError> {
+    pub async fn run(&self, prompt: impl IntoPrompt) -> Result<RunOutput, AgentError> {
         Runtime::new()
-            .run(self, RunRequest::new(self.prompt_messages(prompt.into())))
+            .run(
+                self,
+                RunRequest::new(self.prompt_messages(prompt.into_prompt())),
+            )
             .await
     }
 
     pub fn stream_run(
         &self,
-        prompt: impl Into<String>,
+        prompt: impl IntoPrompt,
     ) -> impl futures_util::Stream<Item = Result<RunEvent, AgentError>> + Send + Unpin + 'static
     {
         let (sender, receiver) = mpsc::channel(64);
@@ -167,7 +170,7 @@ impl Agent {
         });
         let mut agent = self.clone();
         agent.event_sink = event_sink;
-        let messages = agent.prompt_messages(prompt.into());
+        let messages = agent.prompt_messages(prompt.into_prompt());
 
         tokio::spawn(async move {
             let request = RunRequest::new(messages).with_cancellation_token(cancellation_token);
@@ -179,12 +182,12 @@ impl Agent {
         ReceiverStream::new(receiver)
     }
 
-    pub(crate) fn prompt_messages(&self, prompt: String) -> Vec<Message> {
+    pub(crate) fn prompt_messages(&self, prompt: Message) -> Vec<Message> {
         let mut messages = Vec::with_capacity(2);
         if let Some(instruction) = &self.instruction {
             messages.push(Message::system(instruction));
         }
-        messages.push(Message::user(prompt));
+        messages.push(prompt);
         messages
     }
 

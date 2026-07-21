@@ -14,7 +14,7 @@ pub use agent::{Agent, RunLimits};
 pub use error::{AgentError, ModelError, PolicyError, ToolError};
 pub use event::{EventSink, NoopEventSink, RunEvent};
 pub use g_macros::tool;
-pub use message::{Content, Message, Role};
+pub use message::{Content, ImageDetail, ImageSource, IntoPrompt, Message, Role};
 pub use model::{Model, ModelEvent, ModelEventSink, ModelRequest, ModelResponse, Usage};
 pub use policy::{AllowAll, Policy};
 pub use providers::openai::OpenAIModel;

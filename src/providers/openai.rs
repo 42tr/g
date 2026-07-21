@@ -6,8 +6,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    Content, Message, Model, ModelError, ModelEvent, ModelEventSink, ModelRequest, ModelResponse,
-    Role, ToolSpec, Usage,
+    Content, ImageSource, Message, Model, ModelError, ModelEvent, ModelEventSink, ModelRequest,
+    ModelResponse, Role, ToolSpec, Usage,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -210,9 +210,39 @@ fn messages_to_input(messages: &[Message]) -> Result<Vec<Value>, ModelError> {
                 } else {
                     "user"
                 };
+                let mut parts = Vec::new();
+                for content in &message.content {
+                    match content {
+                        Content::Text { text } => parts.push(json!({
+                            "type": "input_text",
+                            "text": text
+                        })),
+                        Content::Image { source, detail } if message.role == Role::User => {
+                            let mut part = json!({
+                                "type": "input_image",
+                                "detail": detail.as_str()
+                            });
+                            match source {
+                                ImageSource::Url { url } => part["image_url"] = json!(url),
+                                ImageSource::FileId { file_id } => part["file_id"] = json!(file_id),
+                            }
+                            parts.push(part);
+                        }
+                        Content::Image { .. } => {
+                            return Err(ModelError::new(
+                                "OpenAI image input is only supported in user messages",
+                            ));
+                        }
+                        _ => {
+                            return Err(ModelError::new(format!(
+                                "unsupported content in {role} message"
+                            )));
+                        }
+                    }
+                }
                 input.push(json!({
                     "role": role,
-                    "content": message.text_content()
+                    "content": parts
                 }));
             }
             Role::Assistant => {
@@ -249,6 +279,11 @@ fn messages_to_input(messages: &[Message]) -> Result<Vec<Value>, ModelError> {
                                 ModelError::new(format!("failed to serialize tool arguments: {error}"))
                             )?
                         })),
+                        Content::Image { .. } => {
+                            return Err(ModelError::new(
+                                "image content is not supported in assistant messages",
+                            ));
+                        }
                         Content::ToolResult { .. } | Content::ProviderData { .. } => {}
                     }
                 }
@@ -447,5 +482,42 @@ mod tests {
         assert_eq!(input[0]["type"], "function_call_output");
         assert_eq!(input[0]["call_id"], "call-1");
         assert_eq!(input[0]["output"], "{\"sum\":42}");
+    }
+
+    #[test]
+    fn converts_url_data_url_and_file_id_image_inputs() {
+        let messages = vec![Message::user_content(vec![
+            Content::text("Compare these images"),
+            Content::image_url_with_detail(
+                "https://example.com/image.png",
+                crate::ImageDetail::Low,
+            ),
+            Content::image_url("data:image/png;base64,aGVsbG8="),
+            Content::image_file_with_detail("file-123", crate::ImageDetail::Original),
+        ])];
+
+        let input = messages_to_input(&messages).unwrap();
+        let parts = input[0]["content"].as_array().unwrap();
+        assert_eq!(
+            parts[0],
+            json!({ "type": "input_text", "text": "Compare these images" })
+        );
+        assert_eq!(
+            parts[1],
+            json!({
+                "type": "input_image",
+                "image_url": "https://example.com/image.png",
+                "detail": "low"
+            })
+        );
+        assert_eq!(parts[2]["image_url"], "data:image/png;base64,aGVsbG8=");
+        assert_eq!(
+            parts[3],
+            json!({
+                "type": "input_image",
+                "file_id": "file-123",
+                "detail": "original"
+            })
+        );
     }
 }
