@@ -1,6 +1,10 @@
-use std::sync::Arc;
+use std::{
+    io::{self, Write},
+    sync::Arc,
+};
 
-use g::{Agent, OpenAIModel, ToolCallError, tool};
+use futures_util::StreamExt;
+use g::{Agent, OpenAIModel, RunEvent, ToolCallError, tool};
 use serde_json::{Value, json};
 
 #[tool(name = "add", description = "Add two integers")]
@@ -20,7 +24,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .tools([add])
         .instruction("Always use the add tool to answer arithmetic addition questions.");
 
-    let output = agent.run("What is 20 + 22?").await?;
-    println!("{}", output.final_text);
+    let mut events = agent.stream_run("What is 20 + 22?");
+    while let Some(event) = events.next().await {
+        match event? {
+            RunEvent::TextDelta { text, .. } => {
+                print!("{text}");
+                io::stdout().flush()?;
+            }
+            RunEvent::Completed { .. } => println!(),
+            _ => {}
+        }
+    }
     Ok(())
 }

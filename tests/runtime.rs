@@ -5,6 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use g::{
     Agent, AgentError, Content, Message, Model, ModelError, ModelRequest, ModelResponse, Role,
     RunLimits, RunRequest, Runtime, Tool, ToolBehavior, ToolContext, ToolError, ToolSpec,
@@ -235,4 +236,26 @@ async fn rejects_an_unnamed_handoff_agent_before_calling_the_model() {
 
     assert!(matches!(error, AgentError::InvalidConfiguration(_)));
     assert!(parent_model.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn streams_text_and_lifecycle_events() {
+    let model = Arc::new(ScriptedModel::new([ModelResponse::new(
+        Message::assistant("streamed answer"),
+    )]));
+    let agent = Agent::new(model);
+    let mut stream = agent.stream_run("hello");
+    let mut text = String::new();
+    let mut completed = false;
+
+    while let Some(event) = stream.next().await {
+        match event.unwrap() {
+            g::RunEvent::TextDelta { text: delta, .. } => text.push_str(&delta),
+            g::RunEvent::Completed { .. } => completed = true,
+            _ => {}
+        }
+    }
+
+    assert_eq!(text, "streamed answer");
+    assert!(completed);
 }

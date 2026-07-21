@@ -1,10 +1,13 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crate::{
-    AgentError, AllowAll, EventSink, IntoTool, Message, Model, NoopEventSink, Policy, RunOutput,
-    RunRequest, Runtime, Tool, ToolBehavior, ToolSpec,
+    AgentError, AllowAll, EventSink, IntoTool, Message, Model, NoopEventSink, Policy, RunEvent,
+    RunOutput, RunRequest, Runtime, Tool, ToolBehavior, ToolSpec,
 };
 use serde_json::json;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RunLimits {
@@ -23,6 +26,7 @@ impl Default for RunLimits {
     }
 }
 
+#[derive(Clone)]
 pub struct Agent {
     pub(crate) model: Arc<dyn Model>,
     pub(crate) tools: HashMap<String, Arc<dyn Tool>>,
@@ -149,6 +153,32 @@ impl Agent {
             .await
     }
 
+    pub fn stream_run(
+        &self,
+        prompt: impl Into<String>,
+    ) -> impl futures_util::Stream<Item = Result<RunEvent, AgentError>> + Send + Unpin + 'static
+    {
+        let (sender, receiver) = mpsc::channel(64);
+        let cancellation_token = CancellationToken::new();
+        let event_sink = Arc::new(StreamEventSink {
+            sender: sender.clone(),
+            downstream: self.event_sink.clone(),
+            cancellation_token: cancellation_token.clone(),
+        });
+        let mut agent = self.clone();
+        agent.event_sink = event_sink;
+        let messages = agent.prompt_messages(prompt.into());
+
+        tokio::spawn(async move {
+            let request = RunRequest::new(messages).with_cancellation_token(cancellation_token);
+            if let Err(error) = Runtime::new().run(&agent, request).await {
+                let _ = sender.send(Err(error)).await;
+            }
+        });
+
+        ReceiverStream::new(receiver)
+    }
+
     pub(crate) fn prompt_messages(&self, prompt: String) -> Vec<Message> {
         let mut messages = Vec::with_capacity(2);
         if let Some(instruction) = &self.instruction {
@@ -196,6 +226,22 @@ impl Agent {
             agent.validate()?;
         }
         Ok(())
+    }
+}
+
+struct StreamEventSink {
+    sender: mpsc::Sender<Result<RunEvent, AgentError>>,
+    downstream: Arc<dyn EventSink>,
+    cancellation_token: CancellationToken,
+}
+
+#[async_trait::async_trait]
+impl EventSink for StreamEventSink {
+    async fn emit(&self, event: RunEvent) {
+        self.downstream.emit(event.clone()).await;
+        if self.sender.send(Ok(event)).await.is_err() {
+            self.cancellation_token.cancel();
+        }
     }
 }
 

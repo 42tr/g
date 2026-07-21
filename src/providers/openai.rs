@@ -1,10 +1,13 @@
 use async_trait::async_trait;
+use eventsource_stream::Eventsource;
+use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    Content, Message, Model, ModelError, ModelRequest, ModelResponse, Role, ToolSpec, Usage,
+    Content, Message, Model, ModelError, ModelEvent, ModelEventSink, ModelRequest, ModelResponse,
+    Role, ToolSpec, Usage,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -55,14 +58,7 @@ impl Model for OpenAIModel {
             tools = request.tools.len(),
             "sending OpenAI Responses API request"
         );
-        let input = messages_to_input(&request.messages)?;
-        let tools: Vec<_> = request.tools.iter().map(tool_to_api).collect();
-        let body = json!({
-            "model": self.model,
-            "input": input,
-            "tools": tools,
-            "store": false
-        });
+        let body = self.request_body(&request, false)?;
 
         let response = self
             .client
@@ -94,6 +90,104 @@ impl Model for OpenAIModel {
             "parsed OpenAI model response"
         );
         Ok(response)
+    }
+
+    async fn generate_stream(
+        &self,
+        request: ModelRequest,
+        event_sink: &dyn ModelEventSink,
+    ) -> Result<ModelResponse, ModelError> {
+        tracing::debug!(
+            model = %self.model,
+            messages = request.messages.len(),
+            tools = request.tools.len(),
+            "opening OpenAI Responses API stream"
+        );
+        let body = self.request_body(&request, true)?;
+        let response = self
+            .client
+            .post(format!("{}/responses", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| ModelError::retryable(error.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .map_err(|error| ModelError::retryable(error.to_string()))?;
+            return Err(api_status_error(status, &body));
+        }
+
+        let mut events = response.bytes_stream().eventsource();
+        while let Some(event) = events.next().await {
+            let event = event
+                .map_err(|error| ModelError::retryable(format!("OpenAI stream error: {error}")))?;
+            if event.data == "[DONE]" {
+                continue;
+            }
+            let payload: Value = serde_json::from_str(&event.data).map_err(|error| {
+                ModelError::new(format!("invalid OpenAI stream event: {error}"))
+            })?;
+            match payload.get("type").and_then(Value::as_str) {
+                Some("response.output_text.delta" | "response.refusal.delta") => {
+                    if let Some(text) = payload.get("delta").and_then(Value::as_str) {
+                        event_sink
+                            .emit(ModelEvent::TextDelta { text: text.into() })
+                            .await;
+                    }
+                }
+                Some("response.completed") => {
+                    let response = payload.get("response").cloned().ok_or_else(|| {
+                        ModelError::new("OpenAI completed event is missing `response`")
+                    })?;
+                    let response: ApiResponse =
+                        serde_json::from_value(response).map_err(|error| {
+                            ModelError::new(format!("invalid OpenAI completed event: {error}"))
+                        })?;
+                    return response_to_model(response);
+                }
+                Some("response.failed" | "response.incomplete") => {
+                    let response = payload.get("response").cloned().ok_or_else(|| {
+                        ModelError::new("OpenAI terminal event is missing `response`")
+                    })?;
+                    let response: ApiResponse =
+                        serde_json::from_value(response).map_err(|error| {
+                            ModelError::new(format!("invalid OpenAI terminal event: {error}"))
+                        })?;
+                    return response_to_model(response);
+                }
+                Some("error") => {
+                    let message = payload
+                        .pointer("/error/message")
+                        .or_else(|| payload.get("message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown streaming error");
+                    return Err(ModelError::new(format!("OpenAI stream error: {message}")));
+                }
+                _ => {}
+            }
+        }
+
+        Err(ModelError::retryable(
+            "OpenAI stream ended before a completed response",
+        ))
+    }
+}
+
+impl OpenAIModel {
+    fn request_body(&self, request: &ModelRequest, stream: bool) -> Result<Value, ModelError> {
+        let input = messages_to_input(&request.messages)?;
+        let tools: Vec<_> = request.tools.iter().map(tool_to_api).collect();
+        Ok(json!({
+            "model": self.model,
+            "input": input,
+            "tools": tools,
+            "store": false,
+            "stream": stream
+        }))
     }
 }
 

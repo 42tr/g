@@ -17,6 +17,10 @@ pub enum RunEvent {
         message: Message,
         usage: Usage,
     },
+    TextDelta {
+        turn: usize,
+        text: String,
+    },
     ToolStarted {
         call_id: String,
         name: String,

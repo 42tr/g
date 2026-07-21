@@ -1,10 +1,14 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    Agent, AgentError, Content, Message, ModelRequest, Role, RunEvent, ToolContext, Usage,
+    Agent, AgentError, Content, EventSink, Message, ModelEvent, ModelEventSink, ModelRequest, Role,
+    RunEvent, ToolContext, Usage,
 };
 
 #[derive(Clone, Debug)]
@@ -83,12 +87,19 @@ impl Runtime {
             tracing::debug!(%run_id, turn, "requesting model response");
             agent.event_sink.emit(RunEvent::ModelStarted { turn }).await;
 
+            let model_events = RuntimeModelEventSink {
+                event_sink: agent.event_sink.clone(),
+                turn,
+            };
             let response = agent
                 .model
-                .generate(ModelRequest {
-                    messages: request.messages.clone(),
-                    tools: tool_specs.clone(),
-                })
+                .generate_stream(
+                    ModelRequest {
+                        messages: request.messages.clone(),
+                        tools: tool_specs.clone(),
+                    },
+                    &model_events,
+                )
                 .await?;
 
             if response.message.role != Role::Assistant {
@@ -203,9 +214,11 @@ impl Runtime {
                         })
                         .await;
 
-                    let child_request = RunRequest::new(child.prompt_messages(task.into()))
+                    let mut child_agent = child.as_ref().clone();
+                    child_agent.event_sink = agent.event_sink.clone();
+                    let child_request = RunRequest::new(child_agent.prompt_messages(task.into()))
                         .with_cancellation_token(request.cancellation_token.clone());
-                    match Box::pin(self.run(child, child_request)).await {
+                    match Box::pin(self.run(&child_agent, child_request)).await {
                         Ok(output) => {
                             usage.add(output.usage);
                             tracing::info!(
@@ -321,6 +334,27 @@ impl Runtime {
 
         tracing::warn!(%run_id, limit = agent.limits.max_turns, "maximum turn limit exceeded");
         Err(AgentError::MaxTurnsExceeded(agent.limits.max_turns))
+    }
+}
+
+struct RuntimeModelEventSink {
+    event_sink: Arc<dyn EventSink>,
+    turn: usize,
+}
+
+#[async_trait]
+impl ModelEventSink for RuntimeModelEventSink {
+    async fn emit(&self, event: ModelEvent) {
+        match event {
+            ModelEvent::TextDelta { text } => {
+                self.event_sink
+                    .emit(RunEvent::TextDelta {
+                        turn: self.turn,
+                        text,
+                    })
+                    .await;
+            }
+        }
     }
 }
 

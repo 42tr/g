@@ -37,7 +37,30 @@ impl ModelResponse {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelEvent {
+    TextDelta { text: String },
+}
+
+#[async_trait]
+pub trait ModelEventSink: Send + Sync {
+    async fn emit(&self, event: ModelEvent);
+}
+
 #[async_trait]
 pub trait Model: Send + Sync {
     async fn generate(&self, request: ModelRequest) -> Result<ModelResponse, ModelError>;
+
+    async fn generate_stream(
+        &self,
+        request: ModelRequest,
+        event_sink: &dyn ModelEventSink,
+    ) -> Result<ModelResponse, ModelError> {
+        let response = self.generate(request).await?;
+        let text = response.message.text_content();
+        if !text.is_empty() {
+            event_sink.emit(ModelEvent::TextDelta { text }).await;
+        }
+        Ok(response)
+    }
 }
