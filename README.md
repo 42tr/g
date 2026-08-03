@@ -2,7 +2,7 @@
 
 `g` 是一个轻量的 Rust Agent 运行时。它负责在模型、工具和子 Agent 之间驱动多轮对话，并提供流式事件、工具调用策略、运行限额、取消以及图像输入等基础能力。
 
-目前内置的模型适配器基于 OpenAI Responses API；同时也可以通过实现 `Model` trait 接入其他模型。
+目前内置两个 OpenAI 模型适配器：`OpenAIModel` 基于 Responses API，`OpenAIChatModel` 基于 Chat Completions API；同时也可以通过实现 `Model` trait 接入其他模型。
 
 ## 功能
 
@@ -18,19 +18,31 @@
 ## 环境要求
 
 - Rust 2024 edition 对应的工具链
-- 可用的 OpenAI API Key，或兼容 OpenAI Responses API 的服务
+- 可用的 OpenAI API Key，或兼容 OpenAI Responses API / Chat Completions API 的服务
 
 配置环境变量：
 
 ```bash
 export OPENAI_API_KEY="your-api-key"
-# 可选，默认值为 gpt-5.6
-export OPENAI_MODEL="gpt-5.6"
+# 可选，responses 或 chat/completions，默认值为 chat
+export OPENAI_TYPE="chat"
+# 可选，Responses API 默认值为 gpt-5.6，Chat Completions API 默认值为 gpt-4o
+export OPENAI_MODEL="gpt-4o"
 # 可选，默认值为 https://api.openai.com/v1
 export OPENAI_BASE_URL="https://api.openai.com/v1"
 ```
 
-`OPENAI_BASE_URL` 应指向 API 的 `/v1` 根路径，运行时会向其下的 `/responses` 发起请求。
+`OPENAI_BASE_URL` 应指向 API 的 `/v1` 根路径。`OpenAIModel` 会向其下的 `/responses` 发起请求，`OpenAIChatModel` 会向其下的 `/chat/completions` 发起请求。
+
+如果希望通过单一入口根据 `OPENAI_TYPE` 自动选择接口，可以使用 `g::openai_from_env()`：
+
+```rust
+use g::{openai_from_env, Agent};
+use std::sync::Arc;
+
+let model = openai_from_env()?;
+let agent = Agent::new(model);
+```
 
 ## 快速开始
 
@@ -200,8 +212,11 @@ let agent = Agent::new(model).with_limits(RunLimits {
 ## 示例
 
 ```bash
-# 工具调用与流式输出
+# 工具调用与流式输出（Responses API）
 cargo run --example calculator
+
+# 工具调用与流式输出（Chat Completions API）
+cargo run --example chat_completions
 
 # 图像理解
 cargo run --example vision
