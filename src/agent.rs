@@ -1,8 +1,8 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crate::{
-    AgentError, AllowAll, EventSink, IntoPrompt, IntoTool, Message, Model, NoopEventSink, Policy,
-    RunEvent, RunOutput, RunRequest, Runtime, Tool, ToolBehavior, ToolSpec,
+    AgentError, AllowAll, EventSink, IntoPrompt, IntoTool, Model, NoopEventSink, Policy, RunEvent,
+    RunOutput, RunRequest, Runtime, Tool, ToolBehavior, ToolSpec,
 };
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -33,7 +33,7 @@ pub struct Agent {
     pub(crate) policy: Arc<dyn Policy>,
     pub(crate) event_sink: Arc<dyn EventSink>,
     pub(crate) limits: RunLimits,
-    instruction: Option<String>,
+    pub(crate) instruction: Option<String>,
     name: Option<String>,
     description: Option<String>,
     handoffs: Vec<Arc<Agent>>,
@@ -149,10 +149,7 @@ impl Agent {
 
     pub async fn run(&self, prompt: impl IntoPrompt) -> Result<RunOutput, AgentError> {
         Runtime::new()
-            .run(
-                self,
-                RunRequest::new(self.prompt_messages(prompt.into_prompt())),
-            )
+            .run(self, RunRequest::new(vec![prompt.into_prompt()]))
             .await
     }
 
@@ -161,34 +158,7 @@ impl Agent {
         prompt: impl IntoPrompt,
     ) -> impl futures_util::Stream<Item = Result<RunEvent, AgentError>> + Send + Unpin + 'static
     {
-        let (sender, receiver) = mpsc::channel(64);
-        let cancellation_token = CancellationToken::new();
-        let event_sink = Arc::new(StreamEventSink {
-            sender: sender.clone(),
-            downstream: self.event_sink.clone(),
-            cancellation_token: cancellation_token.clone(),
-        });
-        let mut agent = self.clone();
-        agent.event_sink = event_sink;
-        let messages = agent.prompt_messages(prompt.into_prompt());
-
-        tokio::spawn(async move {
-            let request = RunRequest::new(messages).with_cancellation_token(cancellation_token);
-            if let Err(error) = Runtime::new().run(&agent, request).await {
-                let _ = sender.send(Err(error)).await;
-            }
-        });
-
-        ReceiverStream::new(receiver)
-    }
-
-    pub(crate) fn prompt_messages(&self, prompt: Message) -> Vec<Message> {
-        let mut messages = Vec::with_capacity(2);
-        if let Some(instruction) = &self.instruction {
-            messages.push(Message::system(instruction));
-        }
-        messages.push(prompt);
-        messages
+        Runtime::new().stream_run(self, RunRequest::new(vec![prompt.into_prompt()]))
     }
 
     pub(crate) fn handoff_by_tool_name(&self, tool_name: &str) -> Option<&Arc<Agent>> {
@@ -232,10 +202,10 @@ impl Agent {
     }
 }
 
-struct StreamEventSink {
-    sender: mpsc::Sender<Result<RunEvent, AgentError>>,
-    downstream: Arc<dyn EventSink>,
-    cancellation_token: CancellationToken,
+pub(crate) struct StreamEventSink {
+    pub(crate) sender: mpsc::Sender<Result<RunEvent, AgentError>>,
+    pub(crate) downstream: Arc<dyn EventSink>,
+    pub(crate) cancellation_token: CancellationToken,
 }
 
 #[async_trait::async_trait]
@@ -260,4 +230,23 @@ fn handoff_tool_name(name: &str) -> String {
         })
         .collect();
     format!("handoff_to_{name}")
+}
+
+pub(crate) struct CancelOnDropStream {
+    pub(crate) inner: ReceiverStream<Result<RunEvent, AgentError>>,
+    pub(crate) token: CancellationToken,
+}
+impl Drop for CancelOnDropStream {
+    fn drop(&mut self) {
+        self.token.cancel();
+    }
+}
+impl futures_util::Stream for CancelOnDropStream {
+    type Item = Result<RunEvent, AgentError>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
 }

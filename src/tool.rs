@@ -29,11 +29,33 @@ pub struct ToolContext {
     pub cancellation_token: CancellationToken,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolOutput {
+    pub value: Value,
+    pub is_error: bool,
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
 
+    fn origin(&self) -> crate::ToolOrigin {
+        crate::ToolOrigin::Local
+    }
+
     async fn call(&self, context: ToolContext, input: Value) -> Result<Value, ToolError>;
+
+    /// Override to return a structured tool error without changing existing tools.
+    async fn call_output(
+        &self,
+        context: ToolContext,
+        input: Value,
+    ) -> Result<ToolOutput, ToolError> {
+        self.call(context, input).await.map(|value| ToolOutput {
+            value,
+            is_error: false,
+        })
+    }
 }
 
 pub trait IntoTool {

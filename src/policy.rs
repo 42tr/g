@@ -11,6 +11,19 @@ pub trait Policy: Send + Sync {
         tool: &ToolSpec,
         arguments: &Value,
     ) -> Result<(), PolicyError>;
+
+    /// Stable origin and host identity for request-scoped tools. Existing policies
+    /// remain effective through the default implementation.
+    async fn authorize_extension(
+        &self,
+        context: &ToolContext,
+        tool: &ToolSpec,
+        arguments: &Value,
+        _origin: &crate::ToolOrigin,
+        _scope: &crate::InvocationScope,
+    ) -> Result<(), PolicyError> {
+        self.authorize(context, tool, arguments).await
+    }
 }
 
 #[derive(Debug, Default)]

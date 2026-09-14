@@ -14,6 +14,7 @@
 - 支持 URL、data URL 和 OpenAI file ID 形式的图像输入
 - 支持最大轮数、最大工具调用数、超时和主动取消
 - 通过 `Model`、`Tool`、`Policy` 和 `EventSink` trait 扩展运行时
+- 可选 `mcp` / `skills` feature：每次请求显式传配置，支持运行时替换，无目录扫描；见 [使用说明](docs/extensions.md)
 
 ## 环境要求
 

@@ -3,6 +3,11 @@ name = "g"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+mcp = ["dep:rmcp", "dep:sha2", "dep:jsonschema", "tokio/process"]
+skills = ["dep:sha2", "dep:serde_yaml"]
+
 [dependencies]
 async-trait = "0.1"
 eventsource-stream = "0.2"
@@ -18,9 +23,17 @@ tokio-util = "0.7"
 tokio-stream = "0.1"
 tracing = "0.1"
 uuid = { version = "1", features = ["serde", "v4"] }
+sha2 = { version = "0.10", optional = true }
+serde_yaml = { version = "0.9", optional = true }
+jsonschema = { version = "0.33", default-features = false, optional = true }
+rmcp = { version = "3.3", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"], optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [workspace]
 members = ["g-macros"]
+
+[[example]]
+name = "extensions"
+required-features = ["mcp", "skills"]
