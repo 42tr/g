@@ -54,7 +54,7 @@ struct CheckHistory(Vec<Message>);
 #[async_trait]
 impl Model for CheckHistory {
     async fn generate(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
-        assert_eq!(request.messages, self.0);
+        assert_eq!(*request.messages, self.0);
         Ok(ModelResponse::new(Message::assistant("resumed")))
     }
 }

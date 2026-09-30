@@ -26,6 +26,58 @@ impl Default for RunLimits {
     }
 }
 
+/// Retries for model errors marked `retryable` (network failures, 429, 5xx).
+/// A request is only retried if it had not streamed any text yet.
+#[derive(Clone, Copy, Debug)]
+pub struct RetryPolicy {
+    pub max_retries: u32,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+}
+
+impl RetryPolicy {
+    pub fn none() -> Self {
+        Self {
+            max_retries: 0,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn backoff(&self, attempt: u32) -> Duration {
+        let factor = 2u32.saturating_pow(attempt.saturating_sub(1));
+        self.initial_backoff
+            .saturating_mul(factor)
+            .min(self.max_backoff)
+    }
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 2,
+            initial_backoff: Duration::from_millis(500),
+            max_backoff: Duration::from_secs(8),
+        }
+    }
+}
+
+/// What the runtime does when the policy rejects a model-requested tool call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PolicyDenial {
+    /// Fail the run with `AgentError::Policy`.
+    #[default]
+    Abort,
+    /// Return the rejection to the model as an error tool result and continue.
+    ReportToModel,
+}
+
+#[derive(Clone)]
+pub(crate) struct Handoff {
+    /// `None` for unnamed agents, which `validate` rejects.
+    pub(crate) tool_name: Option<String>,
+    pub(crate) agent: Arc<Agent>,
+}
+
 #[derive(Clone)]
 pub struct Agent {
     pub(crate) model: Arc<dyn Model>,
@@ -34,9 +86,11 @@ pub struct Agent {
     pub(crate) event_sink: Arc<dyn EventSink>,
     pub(crate) limits: RunLimits,
     pub(crate) instruction: Option<String>,
+    pub(crate) retry: RetryPolicy,
+    pub(crate) policy_denial: PolicyDenial,
     name: Option<String>,
     description: Option<String>,
-    handoffs: Vec<Arc<Agent>>,
+    handoffs: Vec<Handoff>,
 }
 
 impl Agent {
@@ -48,6 +102,8 @@ impl Agent {
             event_sink: Arc::new(NoopEventSink),
             limits: RunLimits::default(),
             instruction: None,
+            retry: RetryPolicy::default(),
+            policy_denial: PolicyDenial::default(),
             name: None,
             description: None,
             handoffs: Vec::new(),
@@ -91,12 +147,24 @@ impl Agent {
     where
         I: IntoIterator<Item = Agent>,
     {
-        self.handoffs.extend(agents.into_iter().map(Arc::new));
+        self.handoffs
+            .extend(agents.into_iter().map(|agent| Handoff {
+                tool_name: agent.name.as_deref().map(handoff_tool_name),
+                agent: Arc::new(agent),
+            }));
         self
     }
 
     pub fn register_tool(&mut self, tool: Arc<dyn Tool>) -> Result<(), AgentError> {
         let name = tool.spec().name;
+        self.register_tool_named(name, tool)
+    }
+
+    pub(crate) fn register_tool_named(
+        &mut self,
+        name: String,
+        tool: Arc<dyn Tool>,
+    ) -> Result<(), AgentError> {
         if self.tools.contains_key(&name) {
             return Err(AgentError::DuplicateTool(name));
         }
@@ -119,12 +187,24 @@ impl Agent {
         self
     }
 
+    pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    pub fn on_policy_denial(mut self, mode: PolicyDenial) -> Self {
+        self.policy_denial = mode;
+        self
+    }
+
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
         let mut specs: Vec<_> = self.tools.values().map(|tool| tool.spec()).collect();
-        specs.extend(self.handoffs.iter().filter_map(|agent| {
+        specs.extend(self.handoffs.iter().filter_map(|handoff| {
+            let tool_name = handoff.tool_name.clone()?;
+            let agent = &handoff.agent;
             let name = agent.name.as_deref()?;
             Some(ToolSpec {
-                name: handoff_tool_name(name),
+                name: tool_name,
                 description: agent
                     .description
                     .clone()
@@ -162,12 +242,10 @@ impl Agent {
     }
 
     pub(crate) fn handoff_by_tool_name(&self, tool_name: &str) -> Option<&Arc<Agent>> {
-        self.handoffs.iter().find(|agent| {
-            agent
-                .name
-                .as_deref()
-                .is_some_and(|name| handoff_tool_name(name) == tool_name)
-        })
+        self.handoffs
+            .iter()
+            .find(|handoff| handoff.tool_name.as_deref() == Some(tool_name))
+            .map(|handoff| &handoff.agent)
     }
 
     pub(crate) fn display_name(&self) -> &str {
@@ -176,7 +254,7 @@ impl Agent {
 
     pub(crate) fn validate(&self) -> Result<(), AgentError> {
         let mut names = std::collections::HashSet::new();
-        for agent in &self.handoffs {
+        for Handoff { agent, .. } in &self.handoffs {
             let name = agent.name.as_deref().ok_or_else(|| {
                 AgentError::InvalidConfiguration("handoff agents must have a name".into())
             })?;

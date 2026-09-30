@@ -15,7 +15,7 @@ mod runtime;
 pub mod skills;
 mod tool;
 
-pub use agent::{Agent, RunLimits};
+pub use agent::{Agent, PolicyDenial, RetryPolicy, RunLimits};
 pub use error::{AgentError, ModelError, PolicyError, ToolError};
 pub use event::{EventSink, NoopEventSink, RunEvent};
 pub use extensions::{ContextManifest, ExtensionConfig, InvocationScope, ToolOrigin, WarmupReport};

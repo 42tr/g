@@ -130,9 +130,22 @@ async fn lookup(
 }
 ```
 
-需要完整控制 schema、行为元数据或调用上下文时，可以直接实现 `Tool` trait。`ToolContext` 包含本次运行的 `run_id` 和 `CancellationToken`。
+未指定 `description` 时使用函数的文档注释。参数可以是任意实现了 `JsonSchema` 的类型，嵌套结构体会统一放在 schema 根部的 `$defs` 中。类型为 `ToolContext` 的参数（最多一个）不会出现在 schema 中，运行时会注入本次运行的 `run_id` 和 `CancellationToken`：
 
-工具执行失败时，错误会作为带有 `is_error: true` 的工具结果返回给模型，由模型决定如何继续；策略拒绝则会直接结束本次运行。
+```rust
+/// Look up recent market values.
+#[tool]
+async fn lookup(query: Query, context: ToolContext) -> Result<Value, ToolCallError> {
+    if context.cancellation_token.is_cancelled() { /* ... */ }
+    Ok(json!({ "market": query.market }))
+}
+```
+
+需要完整控制 schema 或行为元数据时，可以直接实现 `Tool` trait。
+
+工具执行失败时，错误会作为带有 `is_error: true` 的工具结果返回给模型，由模型决定如何继续。
+
+同一轮中连续的、`ToolBehavior::parallel_safe` 为 `true` 的工具会并发执行，结果仍按调用顺序写回；其他工具和 handoff 按顺序执行。
 
 ## Handoff
 
@@ -155,7 +168,7 @@ let output = agent.run("What is 20 + 22?").await?;
 println!("{}", output.final_text);
 ```
 
-Handoff 会继承父运行的取消信号和事件接收器。子 Agent 的 token 用量会累加到父运行结果中。
+Handoff 会继承父运行的取消信号和事件接收器，并复用父运行已发现的 MCP 工具。子 Agent 的 token 用量会累加到父运行结果中。Policy 收到的 handoff 来源是 `ToolOrigin::Handoff { agent }`。
 
 ## 图像输入
 
@@ -185,13 +198,16 @@ let output = agent.run(prompt).await?;
 let agent = Agent::new(model).with_policy(Arc::new(MyPolicy));
 ```
 
-`stream_run` 会返回以下 `RunEvent`：
+策略拒绝默认直接结束本次运行（`AgentError::Policy`）。设置 `on_policy_denial(PolicyDenial::ReportToModel)` 后，拒绝会作为错误工具结果（`{"error": {"code": "policy_denied", ...}}`）返回给模型。
+
+`stream_run` 会返回以下 `RunEvent`，除 `Finished` 外都带有产生它的运行的 `run_id`，可以据此区分父运行和 handoff 子运行：
 
 - `Started` / `Completed`
-- `ModelStarted` / `ModelCompleted`
+- `ModelStarted` / `ModelCompleted` / `ModelRetry`
 - `TextDelta`
 - `ToolStarted` / `ToolCompleted`
 - `HandoffStarted` / `HandoffCompleted`
+- `Finished { output }`：运行成功时流的最后一项，携带完整的 `RunOutput`
 
 也可以实现 `EventSink`，再通过 `with_event_sink` 将事件发送到日志、指标或审计系统。
 
@@ -207,6 +223,8 @@ let agent = Agent::new(model).with_limits(RunLimits {
     timeout: Duration::from_secs(60),
 });
 ```
+
+标记为 retryable 的模型错误（网络错误、429、5xx）默认以指数退避重试 2 次；已经输出过文本的请求不会重试。可以通过 `with_retry_policy(RetryPolicy { .. })` 调整，或使用 `RetryPolicy::none()` 关闭。OpenAI provider 默认的 HTTP 连接超时为 30 秒、读取间隔超时为 300 秒，可以用 `with_http_client` 替换客户端。
 
 如需主动取消，使用 `Runtime::run` 和带 `CancellationToken` 的 `RunRequest`。丢弃 `stream_run` 返回的事件流后，运行也会在下一次发送事件时收到取消信号。
 
@@ -239,5 +257,3 @@ cargo fmt --check
 cargo test --workspace
 cargo clippy --workspace --all-targets
 ```
-
-当前实现按顺序执行同一轮中的多个工具调用；`ToolBehavior` 已提供 `read_only`、`idempotent` 和 `parallel_safe` 元数据，但运行时暂未据此并行调度。

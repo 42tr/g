@@ -1,4 +1,11 @@
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -7,8 +14,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    Agent, AgentError, Content, EventSink, Message, ModelEvent, ModelEventSink, ModelRequest, Role,
-    RunEvent, ToolContext, Usage,
+    Agent, AgentError, Content, EventSink, Message, ModelEvent, ModelEventSink, ModelRequest,
+    ModelResponse, PolicyDenial, PolicyError, Role, RunEvent, Tool, ToolContext, ToolOrigin,
+    ToolSpec, Usage,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -96,7 +104,8 @@ impl Runtime {
     }
 
     /// Stream a full request, including its extension configuration. Dropping the
-    /// stream cancels this run without cancelling the caller's shared token.
+    /// stream cancels this run without cancelling the caller's shared token. A
+    /// successful run ends with `RunEvent::Finished` carrying the `RunOutput`.
     pub fn stream_run(
         &self,
         agent: &Agent,
@@ -114,9 +123,13 @@ impl Runtime {
         });
         let runtime = self.clone();
         tokio::spawn(async move {
-            if let Err(error) = runtime.run(&agent, request).await {
-                let _ = sender.send(Err(error)).await;
-            }
+            let last = runtime
+                .run(&agent, request)
+                .await
+                .map(|output| RunEvent::Finished {
+                    output: Box::new(output),
+                });
+            let _ = sender.send(last).await;
         });
         crate::agent::CancelOnDropStream {
             inner: tokio_stream::wrappers::ReceiverStream::new(receiver),
@@ -130,201 +143,106 @@ impl Runtime {
         agent: &Agent,
         mut request: RunRequest,
     ) -> Result<crate::WarmupReport, AgentError> {
-        agent.validate()?;
-        request.extensions.validate()?;
-        let token = request.cancellation_token.child_token();
-        let _guard = token.clone().drop_guard();
-        request.cancellation_token = token.clone();
-        tokio::select! {
-            biased;
-            _ = token.cancelled() => Err(AgentError::Cancelled),
-            result = timeout(agent.limits.timeout, self.prepare(agent, &request)) => {
-                let (prepared, diagnostics, _) = result.map_err(|_| AgentError::Timeout)??;
-                Ok(crate::WarmupReport { tools: prepared.tool_specs(), diagnostics })
-            }
-        }
+        let token = begin(agent, &mut request)?;
+        guarded(agent, &token, async {
+            let prepared = self.prepare(agent, &request, None).await?;
+            Ok(crate::WarmupReport {
+                tools: prepared.agent.tool_specs(),
+                diagnostics: prepared.diagnostics,
+            })
+        })
+        .await
     }
 
-    pub async fn run(
+    pub async fn run(&self, agent: &Agent, request: RunRequest) -> Result<RunOutput, AgentError> {
+        self.run_with(agent, request, None).await
+    }
+
+    /// `mcp_tools` lets handoff children reuse the tools their parent already discovered
+    /// for the same extension configuration and scope.
+    async fn run_with(
         &self,
         agent: &Agent,
         mut request: RunRequest,
+        mcp_tools: Option<McpTools>,
     ) -> Result<RunOutput, AgentError> {
-        agent.validate()?;
-        request.extensions.validate()?;
-        let cancellation_token = request.cancellation_token.child_token();
-        let _guard = cancellation_token.clone().drop_guard();
-        request.cancellation_token = cancellation_token.clone();
-        tokio::select! {
-            biased;
-            _ = cancellation_token.cancelled() => {
-                tracing::warn!("agent run cancelled");
-                Err(AgentError::Cancelled)
-            },
-            result = timeout(agent.limits.timeout, self.run_inner(agent, request)) => {
-                match result {
-                    Ok(result) => result,
-                    Err(_) => {
-                        tracing::warn!(timeout_ms = agent.limits.timeout.as_millis(), "agent run timed out");
-                        Err(AgentError::Timeout)
-                    }
-                }
-            }
-        }
+        let token = begin(agent, &mut request)?;
+        guarded(agent, &token, self.run_inner(agent, request, mcp_tools)).await
     }
 
     async fn run_inner(
         &self,
         agent: &Agent,
         mut request: RunRequest,
+        mcp_tools: Option<McpTools>,
     ) -> Result<RunOutput, AgentError> {
-        let run_id = Uuid::new_v4();
-        let (prepared, diagnostics, _skill_state) = self.prepare(agent, &request).await?;
-        let agent = &prepared;
-        let mut injected = 0;
-        if request.instructions_mode == InstructionsMode::Compose {
-            let mut prefix = Vec::new();
-            if let Some(instruction) = &agent.instruction {
-                prefix.push(Message::system(instruction));
-            }
-            #[cfg(feature = "skills")]
-            if let Some(state) = &_skill_state {
-                prefix.push(Message::system(
-                    state
-                        .index()
-                        .map_err(|e| crate::extensions::invalid(e.message))?,
-                ));
-                for name in &request.selected_skills {
-                    // Explicit activation is also authorized and charged, through the same tool.
-                    let tool = state.tool(true);
-                    let args = json!({"name":name});
-                    let ctx = ToolContext {
-                        run_id,
-                        cancellation_token: request.cancellation_token.clone(),
-                    };
-                    agent
-                        .policy
-                        .authorize_extension(
-                            &ctx,
-                            &tool.spec(),
-                            &args,
-                            &tool.origin(),
-                            &request.scope,
-                        )
-                        .await?;
-                    let content = tool
-                        .call(ctx, args)
-                        .await
-                        .map_err(|e| crate::extensions::invalid(e.message))?;
-                    prefix.push(Message::user(format!(
-                        "Explicitly selected skill context (not additional permissions): {content}"
-                    )));
-                }
-            }
-            injected = prefix.len();
-            prefix.append(&mut request.messages);
-            request.messages = prefix;
-        }
+        let prepared = self.prepare(agent, &request, mcp_tools).await?;
+        // `RunContext` borrows the request, so move the input messages out first.
+        let mut input = std::mem::take(&mut request.messages);
+        let tool_specs: Arc<[ToolSpec]> = prepared.agent.tool_specs().into();
+        let run = RunContext {
+            runtime: self,
+            agent: &prepared.agent,
+            run_id: Uuid::new_v4(),
+            request: &request,
+            spec_index: tool_specs
+                .iter()
+                .enumerate()
+                .map(|(index, spec)| (spec.name.clone(), index))
+                .collect(),
+            tool_specs: tool_specs.clone(),
+            mcp_tools: prepared.mcp_tools.clone(),
+        };
+
+        let mut history = match request.instructions_mode {
+            InstructionsMode::Compose => run.compose_prefix(&prepared.skills).await?,
+            InstructionsMode::Preserve => Vec::new(),
+        };
+        let injected = history.len();
+        let run_id = run.run_id;
+        let agent = run.agent;
+        history.append(&mut input);
+        let mut history = Arc::new(history);
         let mut usage = Usage::default();
         let mut tool_calls = 0;
-        let tool_specs = agent.tool_specs();
 
         tracing::info!(%run_id, "agent run started");
-        agent.event_sink.emit(RunEvent::Started { run_id }).await;
+        run.emit(RunEvent::Started { run_id }).await;
 
-        for turn_index in 0..agent.limits.max_turns {
-            let turn = turn_index + 1;
+        for turn in 1..=agent.limits.max_turns {
             tracing::debug!(%run_id, turn, "requesting model response");
-            agent.event_sink.emit(RunEvent::ModelStarted { turn }).await;
-
-            let model_events = RuntimeModelEventSink {
-                event_sink: agent.event_sink.clone(),
-                turn,
-            };
-            let response = agent
-                .model
-                .generate_stream(
-                    ModelRequest {
-                        messages: request.messages.clone(),
-                        tools: tool_specs.clone(),
-                    },
-                    &model_events,
-                )
+            run.emit(RunEvent::ModelStarted { run_id, turn }).await;
+            let response = run
+                .call_model(turn, ModelRequest::new(history.clone(), tool_specs.clone()))
                 .await?;
-
             if response.message.role != Role::Assistant {
                 return Err(AgentError::InvalidModelResponse(response.message.role));
             }
-
             usage.add(response.usage);
-            agent
-                .event_sink
-                .emit(RunEvent::ModelCompleted {
-                    turn,
-                    message: response.message.clone(),
-                    usage: response.usage,
-                })
-                .await;
+            run.emit(RunEvent::ModelCompleted {
+                run_id,
+                turn,
+                message: response.message.clone(),
+                usage: response.usage,
+            })
+            .await;
 
+            let calls = tool_calls_of(&response.message);
             let final_text = response.message.text_content();
-            let calls: Vec<_> = response
-                .message
-                .content
-                .iter()
-                .filter_map(|content| match content {
-                    Content::ToolCall {
-                        id,
-                        name,
-                        arguments,
-                    } => Some((id.clone(), name.clone(), arguments.clone())),
-                    _ => None,
-                })
-                .collect();
-            request.messages.push(response.message);
+            // Cheap unless a model kept its request alive; then this copies once.
+            let messages = Arc::make_mut(&mut history);
+            messages.push(response.message);
 
             if calls.is_empty() {
-                let conversation_messages = request.messages[injected..].to_vec();
-                #[allow(unused_mut)] // Mutable only with skills enabled.
-                let mut context_manifest = crate::ContextManifest {
-                    diagnostics,
-                    ..Default::default()
-                };
-                #[cfg(feature = "skills")]
-                if let Some(state) = &_skill_state {
-                    context_manifest.active_skills = state.active();
-                }
-                let output = RunOutput {
-                    run_id,
-                    conversation_messages,
-                    context_manifest,
-                    messages: request.messages,
-                    final_text,
-                    turns: turn,
-                    tool_calls,
-                    usage,
-                };
-                agent
-                    .event_sink
-                    .emit(RunEvent::Completed {
-                        run_id,
-                        turns: output.turns,
-                        tool_calls,
-                        usage,
-                    })
-                    .await;
-                tracing::info!(
-                    %run_id,
-                    turns = output.turns,
-                    tool_calls,
-                    input_tokens = usage.input_tokens,
-                    output_tokens = usage.output_tokens,
-                    "agent run completed"
-                );
-                return Ok(output);
+                let messages = Arc::try_unwrap(history).unwrap_or_else(|shared| (*shared).clone());
+                return Ok(run
+                    .finish(
+                        messages, injected, &prepared, final_text, turn, tool_calls, usage,
+                    )
+                    .await);
             }
 
             tracing::debug!(%run_id, turn, tool_calls = calls.len(), "model requested tools");
-
             if tool_calls.saturating_add(calls.len()) > agent.limits.max_tool_calls {
                 tracing::warn!(
                     %run_id,
@@ -335,199 +253,8 @@ impl Runtime {
                     agent.limits.max_tool_calls,
                 ));
             }
-
-            for (call_id, name, arguments) in calls {
-                tool_calls += 1;
-                if request.cancellation_token.is_cancelled() {
-                    return Err(AgentError::Cancelled);
-                }
-                if let Some(child) = agent.handoff_by_tool_name(&name) {
-                    let ctx = ToolContext {
-                        run_id,
-                        cancellation_token: request.cancellation_token.clone(),
-                    };
-                    let spec = tool_specs
-                        .iter()
-                        .find(|s| s.name == name)
-                        .expect("handoff spec");
-                    agent
-                        .policy
-                        .authorize_extension(
-                            &ctx,
-                            spec,
-                            &arguments,
-                            &crate::ToolOrigin::Local,
-                            &request.scope,
-                        )
-                        .await?;
-                    let Some(task) = arguments.get("task").and_then(Value::as_str) else {
-                        let result =
-                            json!({ "error": "handoff requires a string `task` argument" });
-                        emit_handoff_result(
-                            agent,
-                            &call_id,
-                            child.display_name(),
-                            None,
-                            result,
-                            true,
-                            &mut request.messages,
-                        )
-                        .await;
-                        continue;
-                    };
-
-                    tracing::info!(
-                        %run_id,
-                        %call_id,
-                        agent = child.display_name(),
-                        "handoff started"
-                    );
-                    tracing::debug!(
-                        %run_id,
-                        %call_id,
-                        agent = child.display_name(),
-                        task,
-                        "handoff task"
-                    );
-                    agent
-                        .event_sink
-                        .emit(RunEvent::HandoffStarted {
-                            call_id: call_id.clone(),
-                            agent: child.display_name().into(),
-                        })
-                        .await;
-
-                    let mut child_agent = child.as_ref().clone();
-                    child_agent.event_sink = agent.event_sink.clone();
-                    child_agent.policy = Arc::new(crate::extensions::PolicyIntersection(
-                        agent.policy.clone(),
-                        child_agent.policy.clone(),
-                    ));
-                    let child_request = RunRequest::new(vec![Message::user(task)])
-                        .with_cancellation_token(request.cancellation_token.clone())
-                        .with_extensions(request.extensions.clone())
-                        .with_scope(request.scope.clone());
-                    match Box::pin(self.run(&child_agent, child_request)).await {
-                        Ok(output) => {
-                            usage.add(output.usage);
-                            tracing::info!(
-                                %run_id,
-                                %call_id,
-                                child_run_id = %output.run_id,
-                                agent = child.display_name(),
-                                "handoff completed"
-                            );
-                            let result = json!({
-                                "agent": child.display_name(),
-                                "response": output.final_text
-                            });
-                            emit_handoff_result(
-                                agent,
-                                &call_id,
-                                child.display_name(),
-                                Some(output.run_id),
-                                result,
-                                false,
-                                &mut request.messages,
-                            )
-                            .await;
-                        }
-                        Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
-                        Err(error) => {
-                            tracing::warn!(
-                                %run_id,
-                                %call_id,
-                                agent = child.display_name(),
-                                error = %error,
-                                "handoff failed"
-                            );
-                            let result = json!({
-                                "agent": child.display_name(),
-                                "error": error.to_string()
-                            });
-                            emit_handoff_result(
-                                agent,
-                                &call_id,
-                                child.display_name(),
-                                None,
-                                result,
-                                true,
-                                &mut request.messages,
-                            )
-                            .await;
-                        }
-                    }
-                    continue;
-                }
-
-                let Some(tool) = agent.tools.get(&name) else {
-                    tracing::warn!(%run_id, %call_id, tool = %name, "model requested unknown tool");
-                    let result = json!({ "error": format!("unknown tool: {name}") });
-                    emit_tool_result(agent, &call_id, &name, result, true, &mut request.messages)
-                        .await;
-                    continue;
-                };
-
-                tracing::debug!(%run_id, %call_id, tool = %name, %arguments, "authorizing tool call");
-                let context = ToolContext {
-                    run_id,
-                    cancellation_token: request.cancellation_token.clone(),
-                };
-                let spec = tool.spec();
-                agent
-                    .policy
-                    .authorize_extension(
-                        &context,
-                        &spec,
-                        &arguments,
-                        &tool.origin(),
-                        &request.scope,
-                    )
-                    .await?;
-                tracing::info!(%run_id, %call_id, tool = %name, "tool call started");
-                agent
-                    .event_sink
-                    .emit(RunEvent::ToolStarted {
-                        call_id: call_id.clone(),
-                        name: name.clone(),
-                    })
-                    .await;
-
-                match tool.call_output(context, arguments).await {
-                    Ok(result) => {
-                        tracing::debug!(%run_id, %call_id, tool = %name, "tool call result");
-                        tracing::info!(%run_id, %call_id, tool = %name, "tool call completed");
-                        emit_tool_result(
-                            agent,
-                            &call_id,
-                            &name,
-                            result.value,
-                            result.is_error,
-                            &mut request.messages,
-                        )
-                        .await;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            %run_id,
-                            %call_id,
-                            tool = %name,
-                            error = %error,
-                            "tool call failed"
-                        );
-                        let result = json!({ "error": error.message });
-                        emit_tool_result(
-                            agent,
-                            &call_id,
-                            &name,
-                            result,
-                            true,
-                            &mut request.messages,
-                        )
-                        .await;
-                    }
-                }
-            }
+            tool_calls += calls.len();
+            run.execute_calls(calls, &mut usage, messages).await?;
         }
 
         tracing::warn!(%run_id, limit = agent.limits.max_turns, "maximum turn limit exceeded");
@@ -535,9 +262,488 @@ impl Runtime {
     }
 }
 
+/// Validate the request and give it a child token owned by this run.
+fn begin(agent: &Agent, request: &mut RunRequest) -> Result<CancellationToken, AgentError> {
+    agent.validate()?;
+    request.extensions.validate()?;
+    let token = request.cancellation_token.child_token();
+    request.cancellation_token = token.clone();
+    Ok(token)
+}
+
+/// Run `future` under the agent's timeout, stopping early on cancellation. The token
+/// is cancelled when this returns, which stops anything the run left behind.
+async fn guarded<T>(
+    agent: &Agent,
+    token: &CancellationToken,
+    future: impl Future<Output = Result<T, AgentError>>,
+) -> Result<T, AgentError> {
+    let _guard = token.clone().drop_guard();
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => {
+            tracing::warn!("agent run cancelled");
+            Err(AgentError::Cancelled)
+        },
+        result = timeout(agent.limits.timeout, future) => result.unwrap_or_else(|_| {
+            tracing::warn!(timeout_ms = agent.limits.timeout.as_millis(), "agent run timed out");
+            Err(AgentError::Timeout)
+        }),
+    }
+}
+
+struct ToolCall {
+    id: String,
+    name: String,
+    arguments: Value,
+}
+
+fn tool_calls_of(message: &Message) -> Vec<ToolCall> {
+    message
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            Content::ToolCall {
+                id,
+                name,
+                arguments,
+            } => Some(ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Per-run state shared by the helpers below.
+struct RunContext<'a> {
+    runtime: &'a Runtime,
+    agent: &'a Agent,
+    run_id: Uuid,
+    request: &'a RunRequest,
+    tool_specs: Arc<[ToolSpec]>,
+    spec_index: HashMap<String, usize>,
+    mcp_tools: McpTools,
+}
+
+impl RunContext<'_> {
+    fn tool_context(&self) -> ToolContext {
+        ToolContext {
+            run_id: self.run_id,
+            cancellation_token: self.request.cancellation_token.clone(),
+        }
+    }
+
+    async fn emit(&self, event: RunEvent) {
+        self.agent.event_sink.emit(event).await;
+    }
+
+    fn spec(&self, name: &str) -> Option<&ToolSpec> {
+        self.spec_index
+            .get(name)
+            .map(|&index| &self.tool_specs[index])
+    }
+
+    fn is_parallel_tool(&self, name: &str) -> bool {
+        self.agent.tools.contains_key(name)
+            && self
+                .spec(name)
+                .is_some_and(|spec| spec.behavior.parallel_safe)
+    }
+
+    /// `Ok(None)` if allowed, `Ok(Some(result))` if denied and the denial goes back to
+    /// the model, `Err` if denied and the run must stop.
+    async fn authorize(
+        &self,
+        spec: &ToolSpec,
+        arguments: &Value,
+        origin: &ToolOrigin,
+    ) -> Result<Option<Value>, AgentError> {
+        let decision = self
+            .agent
+            .policy
+            .authorize_extension(
+                &self.tool_context(),
+                spec,
+                arguments,
+                origin,
+                &self.request.scope,
+            )
+            .await;
+        match decision {
+            Ok(()) => Ok(None),
+            Err(error) => denied(self.agent.policy_denial, error),
+        }
+    }
+
+    /// System instructions plus, with skills enabled, the skill index and any explicitly
+    /// selected skills.
+    async fn compose_prefix(
+        &self,
+        #[allow(unused_variables)] skills: &SkillsState,
+    ) -> Result<Vec<Message>, AgentError> {
+        let mut prefix = Vec::new();
+        if let Some(instruction) = &self.agent.instruction {
+            prefix.push(Message::system(instruction));
+        }
+        #[cfg(feature = "skills")]
+        if let Some(state) = skills {
+            prefix.push(Message::system(
+                state
+                    .index()
+                    .map_err(|e| crate::extensions::invalid(e.message))?,
+            ));
+            // Explicit activation is also authorized and charged, through the same tool.
+            let tool = state.read_tool();
+            let spec = tool.spec();
+            for name in &self.request.selected_skills {
+                let args = json!({ "name": name });
+                self.agent
+                    .policy
+                    .authorize_extension(
+                        &self.tool_context(),
+                        &spec,
+                        &args,
+                        &tool.origin(),
+                        &self.request.scope,
+                    )
+                    .await?;
+                let content = tool
+                    .call(self.tool_context(), args)
+                    .await
+                    .map_err(|e| crate::extensions::invalid(e.message))?;
+                prefix.push(Message::user(format!(
+                    "Explicitly selected skill context (not additional permissions): {content}"
+                )));
+            }
+        }
+        Ok(prefix)
+    }
+
+    /// Call the model, retrying retryable errors that happen before any text streamed.
+    async fn call_model(
+        &self,
+        turn: usize,
+        request: ModelRequest,
+    ) -> Result<ModelResponse, AgentError> {
+        let retry = self.agent.retry;
+        let mut attempt = 0;
+        loop {
+            let sink = RuntimeModelEventSink {
+                event_sink: self.agent.event_sink.clone(),
+                run_id: self.run_id,
+                turn,
+                emitted: AtomicBool::new(false),
+            };
+            match self
+                .agent
+                .model
+                .generate_stream(request.clone(), &sink)
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if error.retryable
+                        && attempt < retry.max_retries
+                        && !sink.emitted.load(Ordering::Relaxed) =>
+                {
+                    attempt += 1;
+                    let backoff = retry.backoff(attempt);
+                    tracing::warn!(
+                        run_id = %self.run_id,
+                        turn,
+                        attempt,
+                        backoff_ms = backoff.as_millis(),
+                        error = %error,
+                        "retrying model request"
+                    );
+                    self.emit(RunEvent::ModelRetry {
+                        run_id: self.run_id,
+                        turn,
+                        attempt,
+                        error: error.message,
+                        backoff,
+                    })
+                    .await;
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    /// Execute one turn's calls in order. Consecutive `parallel_safe` tools run
+    /// concurrently; results are appended in call order.
+    async fn execute_calls(
+        &self,
+        calls: Vec<ToolCall>,
+        usage: &mut Usage,
+        messages: &mut Vec<Message>,
+    ) -> Result<(), AgentError> {
+        let mut calls = calls.into_iter().peekable();
+        while let Some(call) = calls.next() {
+            if self.request.cancellation_token.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
+            if let Some(child) = self.agent.handoff_by_tool_name(&call.name) {
+                self.execute_handoff(child, call, usage, messages).await?;
+                continue;
+            }
+            let Some(tool) = self.agent.tools.get(&call.name) else {
+                tracing::warn!(
+                    run_id = %self.run_id,
+                    call_id = %call.id,
+                    tool = %call.name,
+                    "model requested unknown tool"
+                );
+                let result = json!({ "error": format!("unknown tool: {}", call.name) });
+                self.emit_tool_result(&call, result, true, messages).await;
+                continue;
+            };
+            let parallel = self.is_parallel_tool(&call.name);
+            let mut batch = vec![(call, tool.clone())];
+            if parallel {
+                while let Some(next) = calls.next_if(|next| self.is_parallel_tool(&next.name)) {
+                    let tool = self.agent.tools[&next.name].clone();
+                    batch.push((next, tool));
+                }
+            }
+            self.execute_tools(batch, messages).await?;
+        }
+        Ok(())
+    }
+
+    async fn execute_tools(
+        &self,
+        batch: Vec<(ToolCall, Arc<dyn Tool>)>,
+        messages: &mut Vec<Message>,
+    ) -> Result<(), AgentError> {
+        let run_id = self.run_id;
+        let mut results: Vec<Option<(Value, bool)>> = Vec::with_capacity(batch.len());
+        let mut allowed = Vec::with_capacity(batch.len());
+        for (index, (call, tool)) in batch.iter().enumerate() {
+            tracing::debug!(%run_id, call_id = %call.id, tool = %call.name, arguments = %call.arguments, "authorizing tool call");
+            let spec = self.spec(&call.name).expect("registered tool spec");
+            if let Some(result) = self
+                .authorize(spec, &call.arguments, &tool.origin())
+                .await?
+            {
+                results.push(Some((result, true)));
+                continue;
+            }
+            tracing::info!(%run_id, call_id = %call.id, tool = %call.name, "tool call started");
+            self.emit(RunEvent::ToolStarted {
+                run_id,
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+            })
+            .await;
+            results.push(None);
+            allowed.push(index);
+        }
+
+        let outputs = futures_util::future::join_all(allowed.iter().map(|&index| {
+            let (call, tool) = &batch[index];
+            tool.call_output(self.tool_context(), call.arguments.clone())
+        }))
+        .await;
+        for (index, output) in allowed.into_iter().zip(outputs) {
+            let call = &batch[index].0;
+            results[index] = Some(match output {
+                Ok(output) => {
+                    tracing::info!(%run_id, call_id = %call.id, tool = %call.name, "tool call completed");
+                    (output.value, output.is_error)
+                }
+                Err(error) => {
+                    tracing::warn!(%run_id, call_id = %call.id, tool = %call.name, error = %error, "tool call failed");
+                    (json!({ "error": error.message }), true)
+                }
+            });
+        }
+
+        for ((call, _), result) in batch.iter().zip(results) {
+            let (value, is_error) = result.expect("every call has a result");
+            self.emit_tool_result(call, value, is_error, messages).await;
+        }
+        Ok(())
+    }
+
+    async fn execute_handoff(
+        &self,
+        child: &Arc<Agent>,
+        call: ToolCall,
+        usage: &mut Usage,
+        messages: &mut Vec<Message>,
+    ) -> Result<(), AgentError> {
+        let run_id = self.run_id;
+        let child_name = child.display_name();
+        let spec = self.spec(&call.name).expect("handoff spec");
+        let origin = ToolOrigin::Handoff {
+            agent: child_name.to_owned(),
+        };
+        if let Some(result) = self.authorize(spec, &call.arguments, &origin).await? {
+            self.emit_handoff_result(&call, child_name, None, result, true, messages)
+                .await;
+            return Ok(());
+        }
+        let Some(task) = call.arguments.get("task").and_then(Value::as_str) else {
+            let result = json!({ "error": "handoff requires a string `task` argument" });
+            self.emit_handoff_result(&call, child_name, None, result, true, messages)
+                .await;
+            return Ok(());
+        };
+
+        tracing::info!(%run_id, call_id = %call.id, agent = child_name, "handoff started");
+        tracing::debug!(%run_id, call_id = %call.id, agent = child_name, task, "handoff task");
+        self.emit(RunEvent::HandoffStarted {
+            run_id,
+            call_id: call.id.clone(),
+            agent: child_name.into(),
+        })
+        .await;
+
+        let mut child_agent = child.as_ref().clone();
+        child_agent.event_sink = self.agent.event_sink.clone();
+        child_agent.policy = Arc::new(crate::extensions::PolicyIntersection(
+            self.agent.policy.clone(),
+            child_agent.policy.clone(),
+        ));
+        let child_request = RunRequest::new(vec![Message::user(task)])
+            .with_cancellation_token(self.request.cancellation_token.clone())
+            .with_extensions(self.request.extensions.clone())
+            .with_scope(self.request.scope.clone());
+        let child_run =
+            self.runtime
+                .run_with(&child_agent, child_request, Some(self.mcp_tools.clone()));
+        match Box::pin(child_run).await {
+            Ok(output) => {
+                usage.add(output.usage);
+                tracing::info!(%run_id, call_id = %call.id, child_run_id = %output.run_id, agent = child_name, "handoff completed");
+                let result = json!({ "agent": child_name, "response": output.final_text });
+                self.emit_handoff_result(
+                    &call,
+                    child_name,
+                    Some(output.run_id),
+                    result,
+                    false,
+                    messages,
+                )
+                .await;
+            }
+            Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
+            Err(error) => {
+                tracing::warn!(%run_id, call_id = %call.id, agent = child_name, error = %error, "handoff failed");
+                let result = json!({ "agent": child_name, "error": error.to_string() });
+                self.emit_handoff_result(&call, child_name, None, result, true, messages)
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn emit_tool_result(
+        &self,
+        call: &ToolCall,
+        result: Value,
+        is_error: bool,
+        messages: &mut Vec<Message>,
+    ) {
+        self.emit(RunEvent::ToolCompleted {
+            run_id: self.run_id,
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            result: result.clone(),
+            is_error,
+        })
+        .await;
+        push_tool_result(&call.id, result, is_error, messages);
+    }
+
+    async fn emit_handoff_result(
+        &self,
+        call: &ToolCall,
+        child_name: &str,
+        child_run_id: Option<Uuid>,
+        result: Value,
+        is_error: bool,
+        messages: &mut Vec<Message>,
+    ) {
+        self.emit(RunEvent::HandoffCompleted {
+            run_id: self.run_id,
+            call_id: call.id.clone(),
+            agent: child_name.to_owned(),
+            child_run_id,
+            is_error,
+        })
+        .await;
+        push_tool_result(&call.id, result, is_error, messages);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish(
+        &self,
+        messages: Vec<Message>,
+        injected: usize,
+        prepared: &Prepared,
+        final_text: String,
+        turns: usize,
+        tool_calls: usize,
+        usage: Usage,
+    ) -> RunOutput {
+        let run_id = self.run_id;
+        #[allow(unused_mut)] // Mutable only with skills enabled.
+        let mut context_manifest = crate::ContextManifest {
+            diagnostics: prepared.diagnostics.clone(),
+            ..Default::default()
+        };
+        #[cfg(feature = "skills")]
+        if let Some(state) = &prepared.skills {
+            context_manifest.active_skills = state.active();
+        }
+        self.emit(RunEvent::Completed {
+            run_id,
+            turns,
+            tool_calls,
+            usage,
+        })
+        .await;
+        tracing::info!(
+            %run_id,
+            turns,
+            tool_calls,
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
+            "agent run completed"
+        );
+        RunOutput {
+            run_id,
+            conversation_messages: messages[injected..].to_vec(),
+            context_manifest,
+            messages,
+            final_text,
+            turns,
+            tool_calls,
+            usage,
+        }
+    }
+}
+
+fn denied(mode: PolicyDenial, error: PolicyError) -> Result<Option<Value>, AgentError> {
+    match mode {
+        PolicyDenial::Abort => Err(error.into()),
+        PolicyDenial::ReportToModel => Ok(Some(json!({
+            "error": { "code": "policy_denied", "message": error.message }
+        }))),
+    }
+}
+
 struct RuntimeModelEventSink {
     event_sink: Arc<dyn EventSink>,
+    run_id: Uuid,
     turn: usize,
+    emitted: AtomicBool,
 }
 
 #[async_trait]
@@ -545,8 +751,10 @@ impl ModelEventSink for RuntimeModelEventSink {
     async fn emit(&self, event: ModelEvent) {
         match event {
             ModelEvent::TextDelta { text } => {
+                self.emitted.store(true, Ordering::Relaxed);
                 self.event_sink
                     .emit(RunEvent::TextDelta {
+                        run_id: self.run_id,
                         turn: self.turn,
                         text,
                     })
@@ -554,48 +762,6 @@ impl ModelEventSink for RuntimeModelEventSink {
             }
         }
     }
-}
-
-async fn emit_tool_result(
-    agent: &Agent,
-    call_id: &str,
-    name: &str,
-    result: Value,
-    is_error: bool,
-    messages: &mut Vec<Message>,
-) {
-    agent
-        .event_sink
-        .emit(RunEvent::ToolCompleted {
-            call_id: call_id.to_owned(),
-            name: name.to_owned(),
-            result: result.clone(),
-            is_error,
-        })
-        .await;
-    push_tool_result(call_id, result, is_error, messages);
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn emit_handoff_result(
-    agent: &Agent,
-    call_id: &str,
-    child_name: &str,
-    child_run_id: Option<Uuid>,
-    result: Value,
-    is_error: bool,
-    messages: &mut Vec<Message>,
-) {
-    agent
-        .event_sink
-        .emit(RunEvent::HandoffCompleted {
-            call_id: call_id.to_owned(),
-            agent: child_name.to_owned(),
-            child_run_id,
-            is_error,
-        })
-        .await;
-    push_tool_result(call_id, result, is_error, messages);
 }
 
 fn push_tool_result(call_id: &str, result: Value, is_error: bool, messages: &mut Vec<Message>) {
@@ -614,38 +780,50 @@ type SkillsState = Option<Arc<crate::skills::SkillState>>;
 #[cfg(not(feature = "skills"))]
 type SkillsState = ();
 
+/// MCP tools discovered for one request, shared with handoff children.
+#[derive(Clone, Default)]
+struct McpTools {
+    #[cfg(feature = "mcp")]
+    tools: Arc<[Arc<dyn Tool>]>,
+    #[cfg(feature = "mcp")]
+    diagnostics: Arc<[String]>,
+}
+
+struct Prepared {
+    agent: Agent,
+    diagnostics: Vec<String>,
+    skills: SkillsState,
+    mcp_tools: McpTools,
+}
+
 impl Runtime {
     async fn prepare(
         &self,
         agent: &Agent,
         request: &RunRequest,
-    ) -> Result<(Agent, Vec<String>, SkillsState), AgentError> {
+        #[allow(unused_variables)] mcp_tools: Option<McpTools>,
+    ) -> Result<Prepared, AgentError> {
         #[allow(unused_mut)] // Feature-dependent registration.
         let mut prepared = agent.clone();
         #[allow(unused_mut)]
         let mut diagnostics = Vec::new();
         #[cfg(feature = "mcp")]
-        for server in &request.extensions.mcp {
-            let manager = self.mcp.as_ref().ok_or_else(|| {
-                crate::extensions::invalid("MCP configuration requires a manager")
-            })?;
-            if manager.is_closed() {
-                return Err(crate::extensions::invalid("manager_closed"));
+        let mcp_tools = {
+            let mcp_tools = match mcp_tools {
+                Some(tools) => tools,
+                None => self.discover_mcp(request).await?,
+            };
+            for tool in mcp_tools.tools.iter() {
+                crate::extensions::register(&mut prepared, tool.clone())?;
             }
-            match manager.tools(server, &request.scope).await {
-                Ok(tools) => {
-                    for tool in tools {
-                        crate::extensions::register(&mut prepared, tool)?;
-                    }
-                }
-                Err(error) if !server.required && !manager.is_closed() => {
-                    diagnostics.push(format!("MCP {} unavailable: {error}", server.id))
-                }
-                Err(error) => return Err(error),
-            }
-        }
+            diagnostics.extend(mcp_tools.diagnostics.iter().cloned());
+            mcp_tools
+        };
+        #[cfg(not(feature = "mcp"))]
+        let mcp_tools = McpTools::default();
+
         #[cfg(feature = "skills")]
-        let state = {
+        let skills = {
             let origins: Vec<_> = prepared.tools.values().map(|t| t.origin()).collect();
             let mut available = Vec::new();
             for skill in &request.extensions.skills {
@@ -671,17 +849,47 @@ impl Runtime {
                 None
             } else {
                 let state = crate::skills::SkillState::new(available);
-                crate::extensions::register(&mut prepared, state.tool(false))?;
-                crate::extensions::register(&mut prepared, state.tool(true))?;
+                crate::extensions::register(&mut prepared, state.list_tool())?;
+                crate::extensions::register(&mut prepared, state.read_tool())?;
                 Some(state)
             }
         };
         #[cfg(not(feature = "skills"))]
-        let state = {
-            if !request.selected_skills.is_empty() {
-                return Err(crate::extensions::invalid("skills feature is disabled"));
+        if !request.selected_skills.is_empty() {
+            return Err(crate::extensions::invalid("skills feature is disabled"));
+        }
+        #[cfg(not(feature = "skills"))]
+        let skills = ();
+        Ok(Prepared {
+            agent: prepared,
+            diagnostics,
+            skills,
+            mcp_tools,
+        })
+    }
+
+    #[cfg(feature = "mcp")]
+    async fn discover_mcp(&self, request: &RunRequest) -> Result<McpTools, AgentError> {
+        let mut tools = Vec::new();
+        let mut diagnostics = Vec::new();
+        for server in &request.extensions.mcp {
+            let manager = self.mcp.as_ref().ok_or_else(|| {
+                crate::extensions::invalid("MCP configuration requires a manager")
+            })?;
+            if manager.is_closed() {
+                return Err(crate::extensions::unavailable("manager_closed"));
             }
-        };
-        Ok((prepared, diagnostics, state))
+            match manager.tools(server, &request.scope).await {
+                Ok(server_tools) => tools.extend(server_tools),
+                Err(error) if !server.required && !manager.is_closed() => {
+                    diagnostics.push(format!("MCP {} unavailable: {error}", server.id))
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(McpTools {
+            tools: tools.into(),
+            diagnostics: diagnostics.into(),
+        })
     }
 }

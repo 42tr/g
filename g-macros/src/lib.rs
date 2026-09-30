@@ -82,12 +82,18 @@ fn expand_tool(
     let tool_name = configured_name
         .map(|name| name.value())
         .unwrap_or_else(|| function_name.to_string());
-    let description = description.map(|value| value.value()).unwrap_or_default();
+    // Without an explicit `description`, fall back to the function's doc comment.
+    let description = description
+        .map(|value| value.value())
+        .unwrap_or_else(|| doc_comment(&function.attrs));
     let attributes = &function.attrs;
     let block = &function.block;
     let mut implementation_signature = function.sig.clone();
     implementation_signature.ident = implementation_name.clone();
 
+    // Every parameter, in order, as passed to the implementation.
+    let mut call_arguments = Vec::new();
+    let mut context_argument = None;
     let mut argument_names = Vec::new();
     let mut argument_types = Vec::new();
     let mut optional_arguments = Vec::new();
@@ -104,22 +110,41 @@ fn expand_tool(
                 "tool parameters must use simple identifier patterns",
             ));
         };
-        argument_names.push(pattern.ident.clone());
+        if is_tool_context(&argument.ty) {
+            if context_argument.is_some() {
+                return Err(syn::Error::new_spanned(
+                    argument,
+                    "#[tool] accepts at most one ToolContext parameter",
+                ));
+            }
+            context_argument = Some(pattern.ident.clone());
+            call_arguments.push(quote!(context));
+            continue;
+        }
+        let name = pattern.ident.clone();
+        call_arguments.push(quote!(#name));
+        argument_names.push(name);
         argument_types.push(argument.ty.as_ref().clone());
         optional_arguments.push(is_option(&argument.ty));
     }
+    let context_binding = if context_argument.is_some() {
+        quote!(context)
+    } else {
+        quote!(_context)
+    };
 
     let schema_properties = argument_names
         .iter()
         .zip(&argument_types)
         .map(|(name, ty)| {
             let name = name.to_string();
+            // One generator for all parameters, so shared types land in a single
+            // root-level `$defs` that their `$ref`s resolve against.
             quote! {
                 properties.insert(
                     #name.to_owned(),
-                    #runtime::__private::serde_json::to_value(
-                        #runtime::__private::schemars::schema_for!(#ty)
-                    ).expect("JSON Schema must be serializable"),
+                    #runtime::__private::serde_json::to_value(generator.subschema_for::<#ty>())
+                        .expect("JSON Schema must be serializable"),
                 );
             }
         });
@@ -166,31 +191,44 @@ fn expand_tool(
         #[#runtime::__private::async_trait::async_trait]
         impl #runtime::Tool for #function_name {
             fn spec(&self) -> #runtime::ToolSpec {
-                let mut properties = #runtime::__private::serde_json::Map::new();
-                #(#schema_properties)*
-                #runtime::ToolSpec {
-                    name: #tool_name.to_owned(),
-                    description: #description.to_owned(),
-                    input_schema: #runtime::__private::serde_json::json!({
-                        "type": "object",
-                        "properties": properties,
-                        "required": [#(#required_arguments),*],
-                        "additionalProperties": false
-                    }),
-                    behavior: #runtime::ToolBehavior::default(),
-                }
+                // The schema is fixed at compile time; generate it once.
+                static SPEC: ::std::sync::LazyLock<#runtime::ToolSpec> =
+                    ::std::sync::LazyLock::new(|| {
+                        let mut generator =
+                            #runtime::__private::schemars::generate::SchemaGenerator::default();
+                        let mut properties = #runtime::__private::serde_json::Map::new();
+                        #(#schema_properties)*
+                        let mut input_schema = #runtime::__private::serde_json::json!({
+                            "type": "object",
+                            "properties": properties,
+                            "required": [#(#required_arguments),*],
+                            "additionalProperties": false
+                        });
+                        let definitions = generator.take_definitions(true);
+                        if !definitions.is_empty() {
+                            input_schema["$defs"] =
+                                #runtime::__private::serde_json::Value::Object(definitions);
+                        }
+                        #runtime::ToolSpec {
+                            name: #tool_name.to_owned(),
+                            description: #description.to_owned(),
+                            input_schema,
+                            behavior: #runtime::ToolBehavior::default(),
+                        }
+                    });
+                SPEC.clone()
             }
 
             async fn call(
                 &self,
-                _context: #runtime::ToolContext,
+                #context_binding: #runtime::ToolContext,
                 input: #runtime::__private::serde_json::Value,
             ) -> Result<#runtime::__private::serde_json::Value, #runtime::ToolError> {
                 let arguments = input.as_object().ok_or_else(||
                     #runtime::ToolError::new("tool arguments must be a JSON object")
                 )?;
                 #(#deserialize_arguments)*
-                let output = #implementation_name(#(#argument_names),*)
+                let output = #implementation_name(#(#call_arguments),*)
                     .await
                     .map_err(|error| #runtime::ToolError::new(error.to_string()))?;
                 #runtime::__private::serde_json::to_value(output)
@@ -202,14 +240,43 @@ fn expand_tool(
     })
 }
 
+fn doc_comment(attributes: &[syn::Attribute]) -> String {
+    attributes
+        .iter()
+        .filter(|attribute| attribute.path().is_ident("doc"))
+        .filter_map(|attribute| match &attribute.meta {
+            syn::Meta::NameValue(MetaNameValue {
+                value:
+                    Expr::Lit(syn::ExprLit {
+                        lit: Lit::Str(text),
+                        ..
+                    }),
+                ..
+            }) => Some(text.value().trim().to_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned()
+}
+
+fn is_tool_context(ty: &Type) -> bool {
+    last_segment_is(ty, "ToolContext")
+}
+
 fn is_option(ty: &Type) -> bool {
+    last_segment_is(ty, "Option")
+}
+
+fn last_segment_is(ty: &Type, name: &str) -> bool {
     let Type::Path(path) = ty else {
         return false;
     };
     path.path
         .segments
         .last()
-        .is_some_and(|segment| segment.ident == "Option")
+        .is_some_and(|segment| segment.ident == name)
 }
 
 fn runtime_crate() -> TokenStream2 {

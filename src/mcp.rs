@@ -1,5 +1,5 @@
 //! MCP clients configured per request. No global config, filesystem discovery or tool replay.
-use crate::extensions::{fingerprint, invalid};
+use crate::extensions::{fingerprint, invalid, unavailable};
 use crate::{
     AgentError, InvocationScope, Tool, ToolBehavior, ToolContext, ToolError, ToolOrigin,
     ToolOutput, ToolSpec,
@@ -24,7 +24,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, Semaphore, watch};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -184,7 +184,7 @@ impl Default for McpPoolOptions {
     }
 }
 struct Entry {
-    result: watch::Receiver<Option<Result<Arc<Connection>, String>>>,
+    result: watch::Receiver<ConnectResult>,
     stop: CancellationToken,
     last_used: Instant,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -213,7 +213,12 @@ pub struct McpManager {
     closed: AtomicBool,
     shutdown: CancellationToken,
     close_lock: Mutex<()>,
+    /// Compiled schema validators keyed by schema fingerprint, reused across runs.
+    validators: std::sync::Mutex<HashMap<String, Arc<jsonschema::Validator>>>,
 }
+/// Bound on cached validators; the cache is cleared when it fills up.
+const MAX_CACHED_VALIDATORS: usize = 4096;
+type ConnectResult = Option<Result<Arc<Connection>, String>>;
 impl std::fmt::Debug for McpManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("McpManager")
@@ -248,6 +253,7 @@ impl McpManager {
             closed: AtomicBool::new(false),
             shutdown: CancellationToken::new(),
             close_lock: Mutex::new(()),
+            validators: std::sync::Mutex::new(HashMap::new()),
         })
     }
     pub fn anonymous() -> Self {
@@ -265,7 +271,7 @@ impl McpManager {
         scope: &InvocationScope,
     ) -> Result<Arc<Connection>, AgentError> {
         if self.closed.load(Ordering::SeqCst) {
-            return Err(invalid("manager_closed"));
+            return Err(unavailable("manager_closed"));
         }
         // Errors from an application credential provider may contain secrets.
         let credentials = tokio::time::timeout(
@@ -274,8 +280,8 @@ impl McpManager {
                 .resolve(scope, config.credential_ref.as_deref()),
         )
         .await
-        .map_err(|_| invalid("credential_timeout"))?
-        .map_err(|_| invalid("credentials_unavailable"))?;
+        .map_err(|_| unavailable("credential_timeout"))?
+        .map_err(|_| unavailable("credentials_unavailable"))?;
         if (config.credential_ref.is_some()
             || credentials.bearer_token.is_some()
             || !credentials.headers.is_empty()
@@ -299,7 +305,7 @@ impl McpManager {
         ));
         let mut entries = self.entries.lock().await;
         if self.closed.load(Ordering::SeqCst) {
-            return Err(invalid("manager_closed"));
+            return Err(unavailable("manager_closed"));
         }
         let mut retired = self.retired.lock().await;
         retired.retain(|task| !task.is_finished());
@@ -320,56 +326,23 @@ impl McpManager {
         drop(retired);
         if !entries.contains_key(&key) {
             if entries.len() >= self.options.max_connections {
-                return Err(invalid("MCP connection capacity exceeded"));
+                return Err(unavailable("MCP connection capacity exceeded"));
             }
             let permit = self
                 .connections
                 .clone()
                 .try_acquire_owned()
-                .map_err(|_| invalid("MCP connection capacity exceeded"))?;
+                .map_err(|_| unavailable("MCP connection capacity exceeded"))?;
             let (tx, rx) = watch::channel(None);
             let stop = self.shutdown.child_token();
-            let task_stop = stop.clone();
-            let config = config.clone();
-            let idle_ttl = self.options.idle_ttl;
-            let task = tokio::spawn(async move {
-                let _permit = permit;
-                let result = tokio::select! {
-                    biased;
-                    _ = task_stop.cancelled() => Err("manager_closed".to_owned()),
-                    r = tokio::time::timeout(Duration::from_millis(config.connect_timeout_ms), connect(&config, credentials)) => match r { Ok(r) => r, Err(_) => Err("MCP connect timeout".into()) }
-                };
-                match result {
-                    Ok(mut service) => {
-                        let connection = Arc::new(Connection {
-                            peer: service.peer().clone(),
-                            stop: task_stop.clone(),
-                            permits: Arc::new(Semaphore::new(config.max_in_flight)),
-                        });
-                        let weak = Arc::downgrade(&connection);
-                        if tx.send(Some(Ok(connection))).is_err() {
-                            task_stop.cancel();
-                        }
-                        // Periodic idle eviction also runs when no new requests arrive.
-                        let mut idle_since = Instant::now();
-                        loop {
-                            tokio::select! {
-                                _ = task_stop.cancelled() => break,
-                                _ = tokio::time::sleep(idle_ttl.min(Duration::from_secs(1))) => {
-                                    // Only the watch channel holds a strong reference when idle.
-                                    if weak.strong_count() > 1 { idle_since = Instant::now(); }
-                                    if weak.strong_count() == 0 || idle_since.elapsed() >= idle_ttl { break; }
-                                }
-                            }
-                        }
-                        task_stop.cancel();
-                        let _ = service.close().await;
-                    }
-                    Err(error) => {
-                        let _ = tx.send(Some(Err(error)));
-                    }
-                }
-            });
+            let task = tokio::spawn(run_connection(
+                config.clone(),
+                credentials,
+                permit,
+                tx,
+                stop.clone(),
+                self.options.idle_ttl,
+            ));
             entries.insert(
                 key.clone(),
                 Entry {
@@ -386,11 +359,11 @@ impl McpManager {
         drop(entries);
         loop {
             if let Some(result) = rx.borrow().clone() {
-                return result.map_err(invalid);
+                return result.map_err(unavailable);
             }
             rx.changed()
                 .await
-                .map_err(|_| invalid("MCP initialization stopped"))?;
+                .map_err(|_| unavailable("MCP initialization stopped"))?;
         }
     }
 
@@ -418,20 +391,20 @@ impl McpManager {
                     .peer
                     .send_request(ClientRequest::ListToolsRequest(req))
                     .await
-                    .map_err(|_| invalid("MCP discovery failed"))?;
+                    .map_err(|_| unavailable("MCP discovery failed"))?;
                 let ServerResult::ListToolsResult(page) = response else {
-                    return Err(invalid("unexpected MCP discovery result"));
+                    return Err(unavailable("unexpected MCP discovery result"));
                 };
                 bytes += serde_json::to_vec(&page)
-                    .map_err(|_| invalid("MCP discovery encoding failed"))?
+                    .map_err(|_| unavailable("MCP discovery encoding failed"))?
                     .len();
                 count += page.tools.len();
                 if count > self.options.max_tools || bytes > self.options.max_discovery_bytes {
-                    return Err(invalid("MCP discovery budget exceeded"));
+                    return Err(unavailable("MCP discovery budget exceeded"));
                 }
                 for remote in page.tools {
                     if !names.insert(remote.name.to_string()) {
-                        return Err(invalid("duplicate remote tool name"));
+                        return Err(unavailable("duplicate remote tool name"));
                     }
                     if !config.allow_all_tools
                         && !config
@@ -442,17 +415,13 @@ impl McpManager {
                         continue;
                     }
                     let input = Value::Object((*remote.input_schema).clone());
-                    reject_external_refs(&input)?;
-                    let validator = jsonschema::validator_for(&input)
-                        .map_err(|_| invalid("unsupported MCP input schema"))?;
+                    let validator = self.validator(&input, "unsupported MCP input schema")?;
                     let output_validator = remote
                         .output_schema
                         .as_ref()
                         .map(|schema| {
                             let schema = Value::Object((**schema).clone());
-                            reject_external_refs(&schema)?;
-                            jsonschema::validator_for(&schema)
-                                .map_err(|_| invalid("unsupported MCP output schema"))
+                            self.validator(&schema, "unsupported MCP output schema")
                         })
                         .transpose()?;
                     let tool = McpTool {
@@ -481,14 +450,35 @@ impl McpManager {
                     break;
                 };
                 if !cursors.insert(next.clone()) || cursors.len() > self.options.max_tools {
-                    return Err(invalid("invalid MCP pagination"));
+                    return Err(unavailable("invalid MCP pagination"));
                 }
             }
             Ok(tools)
         };
         tokio::time::timeout(Duration::from_millis(config.connect_timeout_ms), discovery)
             .await
-            .map_err(|_| invalid("MCP discovery timeout"))?
+            .map_err(|_| unavailable("MCP discovery timeout"))?
+    }
+
+    /// Compile `schema`, reusing a cached validator for an identical schema.
+    fn validator(
+        &self,
+        schema: &Value,
+        error: &'static str,
+    ) -> Result<Arc<jsonschema::Validator>, AgentError> {
+        let key = fingerprint(schema);
+        if let Some(validator) = self.validators.lock().unwrap().get(&key) {
+            return Ok(validator.clone());
+        }
+        reject_external_refs(schema)?;
+        let validator =
+            Arc::new(jsonschema::validator_for(schema).map_err(|_| unavailable(error))?);
+        let mut validators = self.validators.lock().unwrap();
+        if validators.len() >= MAX_CACHED_VALIDATORS {
+            validators.clear();
+        }
+        validators.insert(key, validator.clone());
+        Ok(validator)
     }
 
     pub async fn close(&self) -> Result<(), AgentError> {
@@ -517,6 +507,60 @@ impl Drop for McpManager {
     fn drop(&mut self) {
         self.shutdown.cancel();
     }
+}
+
+/// Connect, publish the result through `tx`, then keep the connection open until it is
+/// stopped or has been idle for `idle_ttl`. Idle eviction also runs when no new requests
+/// arrive.
+async fn run_connection(
+    config: McpServerConfig,
+    credentials: McpCredentials,
+    _permit: OwnedSemaphorePermit,
+    tx: watch::Sender<ConnectResult>,
+    stop: CancellationToken,
+    idle_ttl: Duration,
+) {
+    let connect_timeout = Duration::from_millis(config.connect_timeout_ms);
+    let result = tokio::select! {
+        biased;
+        _ = stop.cancelled() => Err("manager_closed".to_owned()),
+        result = tokio::time::timeout(connect_timeout, connect(&config, credentials)) => {
+            result.unwrap_or_else(|_| Err("MCP connect timeout".into()))
+        }
+    };
+    let mut service = match result {
+        Ok(service) => service,
+        Err(error) => {
+            let _ = tx.send(Some(Err(error)));
+            return;
+        }
+    };
+    let connection = Arc::new(Connection {
+        peer: service.peer().clone(),
+        stop: stop.clone(),
+        permits: Arc::new(Semaphore::new(config.max_in_flight)),
+    });
+    let weak = Arc::downgrade(&connection);
+    if tx.send(Some(Ok(connection))).is_err() {
+        stop.cancel();
+    }
+    let mut idle_since = Instant::now();
+    loop {
+        tokio::select! {
+            _ = stop.cancelled() => break,
+            _ = tokio::time::sleep(idle_ttl.min(Duration::from_secs(1))) => {
+                // Only the watch channel holds a strong reference when idle.
+                if weak.strong_count() > 1 {
+                    idle_since = Instant::now();
+                }
+                if weak.strong_count() == 0 || idle_since.elapsed() >= idle_ttl {
+                    break;
+                }
+            }
+        }
+    }
+    stop.cancel();
+    let _ = service.close().await;
 }
 
 async fn connect(
@@ -593,7 +637,7 @@ fn reject_external_refs(value: &Value) -> Result<(), AgentError> {
                 if matches!(key.as_str(), "$ref" | "$dynamicRef")
                     && value.as_str().is_some_and(|r| !r.starts_with('#'))
                 {
-                    return Err(invalid("external schema references are unsupported"));
+                    return Err(unavailable("external schema references are unsupported"));
                 }
                 reject_external_refs(value)?;
             }
@@ -638,8 +682,8 @@ struct McpTool {
     global: Arc<Semaphore>,
     timeout: Duration,
     max_result: usize,
-    validator: jsonschema::Validator,
-    output_validator: Option<jsonschema::Validator>,
+    validator: Arc<jsonschema::Validator>,
+    output_validator: Option<Arc<jsonschema::Validator>>,
 }
 #[async_trait]
 impl Tool for McpTool {
@@ -663,68 +707,20 @@ impl Tool for McpTool {
         if !self.validator.is_valid(&input) {
             return Ok(failure("invalid_arguments", "not_submitted"));
         }
-        let args = input
-            .as_object()
-            .cloned()
-            .ok_or_else(|| ToolError::new("arguments must be an object"))?;
+        let Value::Object(args) = input else {
+            return Err(ToolError::new("arguments must be an object"));
+        };
         let stop = context.cancellation_token.child_token();
         let _guard = stop.clone().drop_guard();
-        let connection = self.connection.clone();
-        let global = self.global.clone();
-        let duration = self.timeout;
         let params = CallToolRequestParams::new(self.remote_name.clone()).with_arguments(args);
         // Worker retains permits while cancelling/draining even if Runtime drops this future.
-        let task = tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + duration;
-            let permits = tokio::select! {
-                biased;
-                _ = stop.cancelled() => return Err(failure("cancelled", "not_submitted")),
-                _ = connection.stop.cancelled() => return Err(failure("connection_closed", "not_submitted")),
-                r = tokio::time::timeout_at(deadline, async { let global = global.acquire_owned().await; let local = connection.permits.clone().acquire_owned().await; (global, local) }) => r.map_err(|_| failure("queue_timeout", "not_submitted"))?,
-            };
-            let _permits = permits;
-            if stop.is_cancelled() || connection.stop.is_cancelled() {
-                return Err(failure("cancelled", "not_submitted"));
-            }
-            let request = ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(params));
-            let handle = tokio::select! {
-                biased;
-                _ = stop.cancelled() => { connection.stop.cancel(); return Err(failure("cancelled", "unknown")); },
-                _ = connection.stop.cancelled() => return Err(failure("connection_closed", "unknown")),
-                _ = tokio::time::sleep_until(deadline) => { connection.stop.cancel(); return Err(failure("timeout", "unknown")); },
-                result = connection.peer.send_cancellable_request(request, PeerRequestOptions::no_options()) => result.map_err(|_| { connection.stop.cancel(); failure("transport_error", "unknown") })?,
-            };
-            let id = handle.id.clone();
-            let mut response = Box::pin(handle.await_response());
-            tokio::select! {
-                biased;
-                _ = stop.cancelled() => {},
-                _ = connection.stop.cancelled() => return Err(failure("connection_closed", "unknown")),
-                r = &mut response => return r.map_err(|error| {
-                    match error {
-                        rmcp::ServiceError::McpError(_) => failure("protocol_error", "unknown"),
-                        _ => { connection.stop.cancel(); failure("transport_error", "unknown") }
-                    }
-                }),
-                _ = tokio::time::sleep_until(deadline) => {},
-            }
-            let notice = rmcp::model::CancelledNotificationParam::new(
-                Some(id),
-                Some("run cancelled or timed out".into()),
-            );
-            let _ = tokio::time::timeout(
-                Duration::from_secs(1),
-                connection.peer.notify_cancelled(notice),
-            )
-            .await;
-            if tokio::time::timeout(Duration::from_secs(1), &mut response)
-                .await
-                .is_err()
-            {
-                connection.stop.cancel();
-            }
-            Err(failure("cancelled_or_timed_out", "unknown"))
-        });
+        let task = tokio::spawn(execute_call(
+            self.connection.clone(),
+            self.global.clone(),
+            stop,
+            self.timeout,
+            params,
+        ));
         let result = match task
             .await
             .map_err(|_| ToolError::new("MCP worker stopped"))?
@@ -770,6 +766,94 @@ impl Tool for McpTool {
         })
     }
 }
+/// Run one `tools/call` under the global and per-connection budgets. `Err` carries the
+/// failure output to return to the model.
+async fn execute_call(
+    connection: Arc<Connection>,
+    global: Arc<Semaphore>,
+    stop: CancellationToken,
+    duration: Duration,
+    params: CallToolRequestParams,
+) -> Result<ServerResult, ToolOutput> {
+    let deadline = tokio::time::Instant::now() + duration;
+    let acquire = async {
+        let global = global.acquire_owned().await;
+        let local = connection.permits.clone().acquire_owned().await;
+        (global, local)
+    };
+    let _permits = tokio::select! {
+        biased;
+        _ = stop.cancelled() => return Err(failure("cancelled", "not_submitted")),
+        _ = connection.stop.cancelled() => {
+            return Err(failure("connection_closed", "not_submitted"));
+        }
+        permits = tokio::time::timeout_at(deadline, acquire) => {
+            permits.map_err(|_| failure("queue_timeout", "not_submitted"))?
+        }
+    };
+    if stop.is_cancelled() || connection.stop.is_cancelled() {
+        return Err(failure("cancelled", "not_submitted"));
+    }
+
+    let request = ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(params));
+    let send = connection
+        .peer
+        .send_cancellable_request(request, PeerRequestOptions::no_options());
+    let handle = tokio::select! {
+        biased;
+        _ = stop.cancelled() => {
+            connection.stop.cancel();
+            return Err(failure("cancelled", "unknown"));
+        }
+        _ = connection.stop.cancelled() => return Err(failure("connection_closed", "unknown")),
+        _ = tokio::time::sleep_until(deadline) => {
+            connection.stop.cancel();
+            return Err(failure("timeout", "unknown"));
+        }
+        handle = send => handle.map_err(|_| {
+            connection.stop.cancel();
+            failure("transport_error", "unknown")
+        })?,
+    };
+
+    let id = handle.id.clone();
+    let mut response = Box::pin(handle.await_response());
+    tokio::select! {
+        biased;
+        _ = stop.cancelled() => {}
+        _ = connection.stop.cancelled() => return Err(failure("connection_closed", "unknown")),
+        result = &mut response => {
+            return result.map_err(|error| match error {
+                rmcp::ServiceError::McpError(_) => failure("protocol_error", "unknown"),
+                _ => {
+                    connection.stop.cancel();
+                    failure("transport_error", "unknown")
+                }
+            });
+        }
+        _ = tokio::time::sleep_until(deadline) => {}
+    }
+
+    // Cancelled or timed out after submission: tell the server, then give it a moment
+    // to acknowledge before dropping the connection.
+    let notice = rmcp::model::CancelledNotificationParam::new(
+        Some(id),
+        Some("run cancelled or timed out".into()),
+    );
+    let _ = tokio::time::timeout(
+        Duration::from_secs(1),
+        connection.peer.notify_cancelled(notice),
+    )
+    .await;
+    if tokio::time::timeout(Duration::from_secs(1), &mut response)
+        .await
+        .is_err()
+    {
+        connection.stop.cancel();
+    }
+    Err(failure("cancelled_or_timed_out", "unknown"))
+}
+
 fn failure(code: &str, state: &str) -> ToolOutput {
     ToolOutput {
         value: json!({"error":{"code":code,"execution_state":state}}),

@@ -1,50 +1,45 @@
 use async_trait::async_trait;
-use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
-use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::common::{
+    ApiError, OpenAIClient, encode_tool_arguments, encode_tool_result, parse_tool_arguments,
+};
 use crate::{
     Content, ImageSource, Message, Model, ModelError, ModelEvent, ModelEventSink, ModelRequest,
     ModelResponse, Role, ToolSpec, Usage,
 };
 
-const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL: &str = "gpt-5.6";
 const PROVIDER_NAME: &str = "openai";
 
 #[derive(Clone, Debug)]
 pub struct OpenAIModel {
-    client: Client,
-    api_key: String,
-    model: String,
-    base_url: String,
+    client: OpenAIClient,
 }
 
 impl OpenAIModel {
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
-            api_key: api_key.into(),
-            model: model.into(),
-            base_url: DEFAULT_BASE_URL.into(),
+            client: OpenAIClient::new(api_key.into(), model.into()),
         }
     }
 
     pub fn from_env() -> Result<Self, ModelError> {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .map_err(|_| ModelError::new("OPENAI_API_KEY is not set"))?;
-        let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
-        let mut instance = Self::new(api_key, model);
-        if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
-            instance.base_url = base_url.trim_end_matches('/').to_owned();
-        }
-        Ok(instance)
+        Ok(Self {
+            client: OpenAIClient::from_env(DEFAULT_MODEL)?,
+        })
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into().trim_end_matches('/').to_owned();
+        self.client.set_base_url(base_url.into());
+        self
+    }
+
+    /// Replace the default HTTP client (30s connect timeout, 300s read timeout).
+    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
+        self.client.set_http_client(client);
         self
     }
 }
@@ -53,38 +48,16 @@ impl OpenAIModel {
 impl Model for OpenAIModel {
     async fn generate(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
         tracing::debug!(
-            model = %self.model,
+            model = %self.client.model,
             messages = request.messages.len(),
             tools = request.tools.len(),
             "sending OpenAI Responses API request"
         );
         let body = self.request_body(&request, false)?;
-
-        let response = self
-            .client
-            .post(format!("{}/responses", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| ModelError::retryable(error.to_string()))?;
-        let status = response.status();
-        tracing::debug!(%status, model = %self.model, "received OpenAI Responses API response");
-        let body = response
-            .text()
-            .await
-            .map_err(|error| ModelError::retryable(error.to_string()))?;
-
-        if !status.is_success() {
-            tracing::warn!(%status, model = %self.model, "OpenAI Responses API request failed");
-            return Err(api_status_error(status, &body));
-        }
-
-        let response: ApiResponse = serde_json::from_str(&body)
-            .map_err(|error| ModelError::new(format!("invalid OpenAI response: {error}")))?;
+        let response: ApiResponse = self.client.post_json("/responses", &body).await?;
         let response = response_to_model(response)?;
         tracing::debug!(
-            model = %self.model,
+            model = %self.client.model,
             input_tokens = response.usage.input_tokens,
             output_tokens = response.usage.output_tokens,
             "parsed OpenAI model response"
@@ -98,37 +71,19 @@ impl Model for OpenAIModel {
         event_sink: &dyn ModelEventSink,
     ) -> Result<ModelResponse, ModelError> {
         tracing::debug!(
-            model = %self.model,
+            model = %self.client.model,
             messages = request.messages.len(),
             tools = request.tools.len(),
             "opening OpenAI Responses API stream"
         );
         let body = self.request_body(&request, true)?;
-        let response = self
-            .client
-            .post(format!("{}/responses", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| ModelError::retryable(error.to_string()))?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .map_err(|error| ModelError::retryable(error.to_string()))?;
-            return Err(api_status_error(status, &body));
-        }
-
-        let mut events = response.bytes_stream().eventsource();
-        while let Some(event) = events.next().await {
-            let event = event
-                .map_err(|error| ModelError::retryable(format!("OpenAI stream error: {error}")))?;
-            if event.data == "[DONE]" {
-                continue;
+        let mut events = self.client.post_sse("/responses", &body).await?;
+        while let Some(data) = events.next().await {
+            let data = data?;
+            if data == "[DONE]" {
+                break;
             }
-            let payload: Value = serde_json::from_str(&event.data).map_err(|error| {
+            let payload: Value = serde_json::from_str(&data).map_err(|error| {
                 ModelError::new(format!("invalid OpenAI stream event: {error}"))
             })?;
             match payload.get("type").and_then(Value::as_str) {
@@ -139,17 +94,8 @@ impl Model for OpenAIModel {
                             .await;
                     }
                 }
-                Some("response.completed") => {
-                    let response = payload.get("response").cloned().ok_or_else(|| {
-                        ModelError::new("OpenAI completed event is missing `response`")
-                    })?;
-                    let response: ApiResponse =
-                        serde_json::from_value(response).map_err(|error| {
-                            ModelError::new(format!("invalid OpenAI completed event: {error}"))
-                        })?;
-                    return response_to_model(response);
-                }
-                Some("response.failed" | "response.incomplete") => {
+                // `response_to_model` turns failed and incomplete responses into errors.
+                Some("response.completed" | "response.failed" | "response.incomplete") => {
                     let response = payload.get("response").cloned().ok_or_else(|| {
                         ModelError::new("OpenAI terminal event is missing `response`")
                     })?;
@@ -180,14 +126,20 @@ impl Model for OpenAIModel {
 impl OpenAIModel {
     fn request_body(&self, request: &ModelRequest, stream: bool) -> Result<Value, ModelError> {
         let input = messages_to_input(&request.messages)?;
-        let tools: Vec<_> = request.tools.iter().map(tool_to_api).collect();
-        Ok(json!({
-            "model": self.model,
+        let mut body = json!({
+            "model": self.client.model,
             "input": input,
-            "tools": tools,
             "store": false,
+            // With `store: false` the server keeps no reasoning state, so replayed
+            // reasoning items must carry their encrypted content.
+            "include": ["reasoning.encrypted_content"],
             "stream": stream
-        }))
+        });
+        // Some compatible servers reject an empty `tools` array.
+        if !request.tools.is_empty() {
+            body["tools"] = request.tools.iter().map(tool_to_api).collect();
+        }
+        Ok(body)
     }
 }
 
@@ -275,9 +227,7 @@ fn messages_to_input(messages: &[Message]) -> Result<Vec<Value>, ModelError> {
                             "type": "function_call",
                             "call_id": id,
                             "name": name,
-                            "arguments": serde_json::to_string(arguments).map_err(|error|
-                                ModelError::new(format!("failed to serialize tool arguments: {error}"))
-                            )?
+                            "arguments": encode_tool_arguments(arguments)?
                         })),
                         Content::Image { .. } => {
                             return Err(ModelError::new(
@@ -291,15 +241,15 @@ fn messages_to_input(messages: &[Message]) -> Result<Vec<Value>, ModelError> {
             Role::Tool => {
                 for content in &message.content {
                     if let Content::ToolResult {
-                        call_id, result, ..
+                        call_id,
+                        result,
+                        is_error,
                     } = content
                     {
                         input.push(json!({
                             "type": "function_call_output",
                             "call_id": call_id,
-                            "output": serde_json::to_string(result).map_err(|error|
-                                ModelError::new(format!("failed to serialize tool result: {error}"))
-                            )?
+                            "output": encode_tool_result(result, *is_error)?
                         }));
                     }
                 }
@@ -352,9 +302,7 @@ fn response_to_model(response: ApiResponse) -> Result<ModelResponse, ModelError>
                 let call_id = required_string(&item, "call_id")?;
                 let name = required_string(&item, "name")?;
                 let encoded_arguments = required_string(&item, "arguments")?;
-                let arguments = serde_json::from_str(&encoded_arguments).map_err(|error| {
-                    ModelError::new(format!("invalid arguments for tool `{name}`: {error}"))
-                })?;
+                let arguments = parse_tool_arguments(&name, &encoded_arguments)?;
                 content.push(Content::ToolCall {
                     id: call_id,
                     name,
@@ -371,6 +319,11 @@ fn response_to_model(response: ApiResponse) -> Result<ModelResponse, ModelError>
         usage: Usage {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
+            cached_input_tokens: usage.input_tokens_details.unwrap_or_default().cached_tokens,
+            reasoning_tokens: usage
+                .output_tokens_details
+                .unwrap_or_default()
+                .reasoning_tokens,
         },
     })
 }
@@ -380,19 +333,6 @@ fn required_string(item: &Value, field: &str) -> Result<String, ModelError> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| ModelError::new(format!("OpenAI output is missing `{field}`")))
-}
-
-fn api_status_error(status: StatusCode, body: &str) -> ModelError {
-    let message = serde_json::from_str::<ApiErrorEnvelope>(body)
-        .ok()
-        .map(|error| error.error.message)
-        .unwrap_or_else(|| body.to_owned());
-    let message = format!("OpenAI API returned {status}: {message}");
-    if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-        ModelError::retryable(message)
-    } else {
-        ModelError::new(message)
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -406,21 +346,25 @@ struct ApiResponse {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(default)]
 struct ApiUsage {
-    #[serde(default)]
     input_tokens: u64,
-    #[serde(default)]
     output_tokens: u64,
+    // Options: some compatible servers send explicit nulls.
+    input_tokens_details: Option<InputTokensDetails>,
+    output_tokens_details: Option<OutputTokensDetails>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiErrorEnvelope {
-    error: ApiError,
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(default)]
+struct InputTokensDetails {
+    cached_tokens: u64,
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiError {
-    message: String,
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(default)]
+struct OutputTokensDetails {
+    reasoning_tokens: u64,
 }
 
 #[cfg(test)]
@@ -443,6 +387,7 @@ mod tests {
             usage: Some(ApiUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                ..Default::default()
             }),
             error: None,
             incomplete_details: None,
@@ -482,6 +427,51 @@ mod tests {
         assert_eq!(input[0]["type"], "function_call_output");
         assert_eq!(input[0]["call_id"], "call-1");
         assert_eq!(input[0]["output"], "{\"sum\":42}");
+    }
+
+    #[test]
+    fn marks_failed_tool_results_and_accepts_empty_arguments() {
+        let messages = vec![Message::new(
+            Role::Tool,
+            vec![Content::ToolResult {
+                call_id: "call-1".into(),
+                result: json!("boom"),
+                is_error: true,
+            }],
+        )];
+        let input = messages_to_input(&messages).unwrap();
+        assert_eq!(input[0]["output"], r#"{"error":"boom"}"#);
+
+        let response = ApiResponse {
+            status: Some("completed".into()),
+            output: vec![json!({
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "ping",
+                "arguments": ""
+            })],
+            usage: None,
+            error: None,
+            incomplete_details: None,
+        };
+        let message = response_to_model(response).unwrap().message;
+        assert!(message.content.iter().any(|content| matches!(
+            content,
+            Content::ToolCall { arguments, .. } if *arguments == json!({})
+        )));
+    }
+
+    #[test]
+    fn requests_encrypted_reasoning_and_omits_empty_tools() {
+        let model = OpenAIModel::new("key", "model");
+        let body = model
+            .request_body(
+                &ModelRequest::new(vec![Message::user("hi")], Vec::new()),
+                false,
+            )
+            .unwrap();
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        assert!(body.get("tools").is_none());
     }
 
     #[test]

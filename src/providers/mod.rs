@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::{Model, ModelError};
 
+mod common;
 pub mod openai;
 pub mod openai_chat;
 

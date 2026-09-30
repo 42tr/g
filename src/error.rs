@@ -69,6 +69,9 @@ pub enum AgentError {
     DuplicateTool(String),
     #[error("invalid agent configuration: {0}")]
     InvalidConfiguration(String),
+    /// A correctly configured extension (for example an MCP server) failed at runtime.
+    #[error("extension unavailable: {0}")]
+    Extension(String),
     #[error("maximum number of turns exceeded ({0})")]
     MaxTurnsExceeded(usize),
     #[error("maximum number of tool calls exceeded ({0})")]

@@ -22,6 +22,10 @@ pub enum ToolOrigin {
         tool_name: String,
     },
     Skills,
+    /// A handoff to the named child agent.
+    Handoff {
+        agent: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -69,6 +73,11 @@ pub(crate) fn invalid(message: impl Into<String>) -> AgentError {
     AgentError::InvalidConfiguration(message.into())
 }
 
+#[cfg(feature = "mcp")]
+pub(crate) fn unavailable(message: impl Into<String>) -> AgentError {
+    AgentError::Extension(message.into())
+}
+
 #[cfg(any(feature = "skills", feature = "mcp"))]
 pub(crate) fn fingerprint(value: &impl Serialize) -> String {
     use sha2::{Digest, Sha256};
@@ -111,8 +120,9 @@ impl crate::Policy for PolicyIntersection {
 #[cfg(any(feature = "skills", feature = "mcp"))]
 pub(crate) fn register(agent: &mut crate::Agent, tool: Arc<dyn Tool>) -> Result<(), AgentError> {
     let name = tool.spec().name;
-    if agent.tool_specs().iter().any(|s| s.name == name) {
+    // `register_tool` rejects local collisions; handoff names live in a separate list.
+    if agent.handoff_by_tool_name(&name).is_some() {
         return Err(AgentError::DuplicateTool(name));
     }
-    agent.register_tool(tool)
+    agent.register_tool_named(name, tool)
 }

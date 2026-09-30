@@ -259,3 +259,249 @@ async fn streams_text_and_lifecycle_events() {
     assert_eq!(text, "streamed answer");
     assert!(completed);
 }
+
+/// Parallel-safe tool that waits until `expected` calls are in flight at once.
+struct RendezvousTool {
+    name: &'static str,
+    barrier: Arc<tokio::sync::Barrier>,
+}
+
+#[async_trait]
+impl Tool for RendezvousTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name.into(),
+            description: "wait for the other tool".into(),
+            input_schema: json!({"type": "object"}),
+            behavior: ToolBehavior {
+                read_only: true,
+                idempotent: true,
+                parallel_safe: true,
+            },
+        }
+    }
+
+    async fn call(&self, _context: ToolContext, _input: Value) -> Result<Value, ToolError> {
+        self.barrier.wait().await;
+        Ok(json!({ "tool": self.name }))
+    }
+}
+
+fn calls(names: &[&str]) -> ModelResponse {
+    ModelResponse::new(Message::new(
+        Role::Assistant,
+        names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| Content::ToolCall {
+                id: format!("call-{index}"),
+                name: (*name).into(),
+                arguments: json!({}),
+            })
+            .collect(),
+    ))
+}
+
+#[tokio::test]
+async fn runs_parallel_safe_tools_concurrently_and_keeps_result_order() {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let model = Arc::new(ScriptedModel::new([
+        calls(&["first", "second"]),
+        ModelResponse::new(Message::assistant("done")),
+    ]));
+    let agent = Agent::new(model.clone())
+        .tool(RendezvousTool {
+            name: "first",
+            barrier: barrier.clone(),
+        })
+        .tool(RendezvousTool {
+            name: "second",
+            barrier,
+        })
+        .with_limits(RunLimits {
+            timeout: Duration::from_secs(2),
+            ..RunLimits::default()
+        });
+
+    // Sequential execution would deadlock on the barrier and time out.
+    let output = agent.run("go").await.unwrap();
+
+    let results: Vec<_> = output
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|content| match content {
+            Content::ToolResult {
+                call_id, result, ..
+            } => Some((call_id.as_str(), result["tool"].clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        results,
+        vec![("call-0", json!("first")), ("call-1", json!("second"))]
+    );
+}
+
+#[tokio::test]
+async fn retries_retryable_model_errors() {
+    let model = Arc::new(ScriptedModel {
+        responses: Mutex::new(VecDeque::from([
+            Err(ModelError::retryable("503")),
+            Ok(ModelResponse::new(Message::assistant("recovered"))),
+        ])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let agent = Agent::new(model.clone()).with_retry_policy(g::RetryPolicy {
+        max_retries: 1,
+        initial_backoff: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(1),
+    });
+
+    let output = agent.run("hi").await.unwrap();
+
+    assert_eq!(output.final_text, "recovered");
+    assert_eq!(model.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn does_not_retry_non_retryable_model_errors() {
+    let model = Arc::new(ScriptedModel {
+        responses: Mutex::new(VecDeque::from([Err(ModelError::new("bad request"))])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let agent = Agent::new(model.clone());
+
+    let error = agent.run("hi").await.unwrap_err();
+
+    assert!(matches!(error, AgentError::Model(_)));
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+}
+
+struct DenyAdd;
+
+#[async_trait]
+impl g::Policy for DenyAdd {
+    async fn authorize(
+        &self,
+        _context: &ToolContext,
+        tool: &ToolSpec,
+        _arguments: &Value,
+    ) -> Result<(), g::PolicyError> {
+        if tool.name == "add" {
+            return Err(g::PolicyError::new("add is not allowed"));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn can_report_policy_denials_to_the_model() {
+    let model = Arc::new(ScriptedModel::new([
+        tool_call_response(),
+        ModelResponse::new(Message::assistant("I may not add.")),
+    ]));
+    let agent = Agent::new(model.clone())
+        .tools([AddTool])
+        .with_policy(Arc::new(DenyAdd))
+        .on_policy_denial(g::PolicyDenial::ReportToModel);
+
+    let output = agent.run("What is 20 + 22?").await.unwrap();
+
+    assert_eq!(output.final_text, "I may not add.");
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(
+        requests[1].messages.last().unwrap().content,
+        vec![Content::ToolResult {
+            call_id: "call-1".into(),
+            result: json!({
+                "error": { "code": "policy_denied", "message": "add is not allowed" }
+            }),
+            is_error: true,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn stream_ends_with_the_run_output_and_events_carry_the_run_id() {
+    let model = Arc::new(ScriptedModel::new([
+        tool_call_response(),
+        ModelResponse::new(Message::assistant("42")),
+    ]));
+    let agent = Agent::new(model).tools([AddTool]);
+    let events: Vec<_> = agent
+        .stream_run("What is 20 + 22?")
+        .map(Result::unwrap)
+        .collect()
+        .await;
+
+    let g::RunEvent::Started { run_id } = &events[0] else {
+        panic!("first event must be Started");
+    };
+    assert!(events.iter().any(|event| matches!(
+        event,
+        g::RunEvent::ToolCompleted { run_id: id, .. } if id == run_id
+    )));
+    let Some(g::RunEvent::Finished { output }) = events.last() else {
+        panic!("last event must be Finished");
+    };
+    assert_eq!(output.run_id, *run_id);
+    assert_eq!(output.final_text, "42");
+    assert_eq!(output.conversation_messages.len(), 4);
+}
+
+#[tokio::test]
+async fn handoff_is_authorized_with_a_handoff_origin() {
+    struct RecordOrigin(Mutex<Vec<g::ToolOrigin>>);
+    #[async_trait]
+    impl g::Policy for RecordOrigin {
+        async fn authorize(
+            &self,
+            _: &ToolContext,
+            _: &ToolSpec,
+            _: &Value,
+        ) -> Result<(), g::PolicyError> {
+            Ok(())
+        }
+        async fn authorize_extension(
+            &self,
+            _: &ToolContext,
+            _: &ToolSpec,
+            _: &Value,
+            origin: &g::ToolOrigin,
+            _: &g::InvocationScope,
+        ) -> Result<(), g::PolicyError> {
+            self.0.lock().unwrap().push(origin.clone());
+            Ok(())
+        }
+    }
+
+    let child = Agent::new(Arc::new(ScriptedModel::new([ModelResponse::new(
+        Message::assistant("42"),
+    )])))
+    .name("math");
+    let parent_model = Arc::new(ScriptedModel::new([
+        ModelResponse::new(Message::new(
+            Role::Assistant,
+            vec![Content::ToolCall {
+                id: "handoff-1".into(),
+                name: "handoff_to_math".into(),
+                arguments: json!({ "task": "Calculate 20 + 22" }),
+            }],
+        )),
+        ModelResponse::new(Message::assistant("42")),
+    ]));
+    let policy = Arc::new(RecordOrigin(Mutex::new(Vec::new())));
+    let parent = Agent::new(parent_model)
+        .handoff([child])
+        .with_policy(policy.clone());
+
+    parent.run("What is 20 + 22?").await.unwrap();
+
+    assert_eq!(
+        *policy.0.lock().unwrap(),
+        vec![g::ToolOrigin::Handoff {
+            agent: "math".into()
+        }]
+    );
+}

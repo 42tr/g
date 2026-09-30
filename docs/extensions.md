@@ -67,9 +67,9 @@ stdio 传 `McpTransport::Stdio { command, args, cwd, env }`，command/cwd 必须
 
 连接按服务器、实际连接配置、scope、凭证内容和 generation 分区。不同用户不会共用认证连接。修改配置时不需要重建 manager，旧连接由租约与空闲 TTL 回收；manager 还限制跨版本总连接数和在途调用数。首次连接并发合并，取消一个等待者不影响其他等待者。
 
-`allowed_tools=[]` 不暴露任何远端工具；显式设置 `allow_all_tools=true` 才全部暴露，两者不能同时配置。required server 初始化失败使本次 run 失败；optional server 失败在 context_manifest.diagnostics 中报告降级。没有 manager 时 MCP 配置始终报错。
+`allowed_tools=[]` 不暴露任何远端工具；显式设置 `allow_all_tools=true` 才全部暴露，两者不能同时配置。required server 初始化失败使本次 run 失败；optional server 失败在 context_manifest.diagnostics 中报告降级。没有 manager 时 MCP 配置始终报错。配置本身无效时返回 `AgentError::InvalidConfiguration`；配置有效但运行时失败（连接、凭证解析、发现、manager 已关闭等）返回 `AgentError::Extension`。handoff 子 run 复用父 run 发现的工具，不再重新发现。
 
-远端输入/结构化输出按 JSON Schema 校验；外部 schema 引用不支持，不访问文件或网络。MCP isError 保留在 ToolResult 的 is_error 中，工具结果保留文本与 structured_content。传输失败、超时等返回稳定错误代码及 execution_state；提交后失败状态为 unknown，不自动重放。非文本内容报告 unsupported_content。
+远端输入/结构化输出按 JSON Schema 校验，编译后的校验器按 schema 指纹在 manager 内缓存；外部 schema 引用不支持，不访问文件或网络。MCP isError 保留在 ToolResult 的 is_error 中，工具结果保留文本与 structured_content。传输失败、超时等返回稳定错误代码及 execution_state；提交后失败状态为 unknown，不自动重放。非文本内容报告 unsupported_content。
 
 取消/超时会通知远端并进行有界等待；无法确认结束时关闭该连接，共享连接上的其他请求也可能失败。取消不代表远端操作已回滚。排队期间取消不发 tools/call。close 幂等，应用应停止接收请求、等待/取消 run 后调用 close；关闭后的 manager 不再接收新连接。
 
