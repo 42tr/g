@@ -13,7 +13,9 @@ pub mod providers;
 mod runtime;
 #[cfg(feature = "skills")]
 pub mod skills;
+mod task;
 mod tool;
+pub use task::{TASK_INSTRUCTION, TaskBackend, TaskCall, TaskSubmission};
 
 pub use agent::{Agent, PolicyDenial, RetryPolicy, RunLimits};
 pub use error::{AgentError, ModelError, PolicyError, ToolError};

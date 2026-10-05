@@ -80,6 +80,7 @@ pub(crate) struct Handoff {
 
 #[derive(Clone)]
 pub struct Agent {
+    pub(crate) task_backend: Option<Arc<dyn crate::TaskBackend>>,
     pub(crate) model: Arc<dyn Model>,
     pub(crate) tools: HashMap<String, Arc<dyn Tool>>,
     pub(crate) policy: Arc<dyn Policy>,
@@ -96,6 +97,7 @@ pub struct Agent {
 impl Agent {
     pub fn new(model: Arc<dyn Model>) -> Self {
         Self {
+            task_backend: None,
             model,
             tools: HashMap::new(),
             policy: Arc::new(AllowAll),
@@ -165,7 +167,9 @@ impl Agent {
         name: String,
         tool: Arc<dyn Tool>,
     ) -> Result<(), AgentError> {
-        if self.tools.contains_key(&name) {
+        if self.tools.contains_key(&name)
+            || (self.task_backend.is_some() && crate::task::is_task_control(&name))
+        {
             return Err(AgentError::DuplicateTool(name));
         }
         self.tools.insert(name, tool);
@@ -174,6 +178,11 @@ impl Agent {
 
     pub fn with_policy(mut self, policy: Arc<dyn Policy>) -> Self {
         self.policy = policy;
+        self
+    }
+
+    pub fn with_task_backend(mut self, backend: Arc<dyn crate::TaskBackend>) -> Self {
+        self.task_backend = Some(backend);
         self
     }
 
@@ -199,6 +208,9 @@ impl Agent {
 
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
         let mut specs: Vec<_> = self.tools.values().map(|tool| tool.spec()).collect();
+        if self.task_backend.is_some() {
+            specs.extend(crate::task::task_specs());
+        }
         specs.extend(self.handoffs.iter().filter_map(|handoff| {
             let tool_name = handoff.tool_name.clone()?;
             let agent = &handoff.agent;
@@ -253,6 +265,16 @@ impl Agent {
     }
 
     pub(crate) fn validate(&self) -> Result<(), AgentError> {
+        if self.task_backend.is_some()
+            && self
+                .tools
+                .keys()
+                .any(|name| crate::task::is_task_control(name))
+        {
+            return Err(AgentError::InvalidConfiguration(
+                "Task control names are reserved".into(),
+            ));
+        }
         let mut names = std::collections::HashSet::new();
         for Handoff { agent, .. } in &self.handoffs {
             let name = agent.name.as_deref().ok_or_else(|| {

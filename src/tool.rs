@@ -39,6 +39,12 @@ pub struct ToolOutput {
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
 
+    /// Detaching a mutating tool requires an explicit host/tool opt-in.
+    fn background_allowed(&self) -> bool {
+        let behavior = self.spec().behavior;
+        behavior.read_only && behavior.parallel_safe
+    }
+
     fn origin(&self) -> crate::ToolOrigin {
         crate::ToolOrigin::Local
     }

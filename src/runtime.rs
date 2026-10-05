@@ -199,6 +199,9 @@ impl Runtime {
             InstructionsMode::Preserve => Vec::new(),
         };
         let injected = history.len();
+        if agent.task_backend.is_some() {
+            history.push(Message::system(crate::TASK_INSTRUCTION));
+        }
         let run_id = run.run_id;
         let agent = run.agent;
         history.append(&mut input);
@@ -234,6 +237,16 @@ impl Runtime {
             messages.push(response.message);
 
             if calls.is_empty() {
+                if let Some(backend) = &agent.task_backend {
+                    if !backend
+                        .ready_to_finish()
+                        .await
+                        .map_err(|e| crate::extensions::invalid(&e.message))?
+                    {
+                        messages.push(Message::system("Tasks remain attached or completed results have not been received. Use wait_tools/get_tasks to receive required results, detach_tools for background work, or cancel_tools. Your preceding text is a progress update, not a final reply."));
+                        continue;
+                    }
+                }
                 let messages = Arc::try_unwrap(history).unwrap_or_else(|shared| (*shared).clone());
                 return Ok(run
                     .finish(
@@ -243,7 +256,20 @@ impl Runtime {
             }
 
             tracing::debug!(%run_id, turn, tool_calls = calls.len(), "model requested tools");
-            if tool_calls.saturating_add(calls.len()) > agent.limits.max_tool_calls {
+            let charged = calls
+                .iter()
+                .map(|call| {
+                    1 + if agent.task_backend.is_some() && call.name == "run_tools" {
+                        call.arguments
+                            .get("calls")
+                            .and_then(Value::as_array)
+                            .map_or(0, Vec::len)
+                    } else {
+                        0
+                    }
+                })
+                .sum::<usize>();
+            if tool_calls.saturating_add(charged) > agent.limits.max_tool_calls {
                 tracing::warn!(
                     %run_id,
                     limit = agent.limits.max_tool_calls,
@@ -253,7 +279,7 @@ impl Runtime {
                     agent.limits.max_tool_calls,
                 ));
             }
-            tool_calls += calls.len();
+            tool_calls += charged;
             run.execute_calls(calls, &mut usage, messages).await?;
         }
 
@@ -487,6 +513,25 @@ impl RunContext<'_> {
             if self.request.cancellation_token.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
+            if self.agent.task_backend.is_some() && crate::task::is_task_control(&call.name) {
+                let output = self.execute_task_control(&call).await?;
+                let (value, is_error) = match output {
+                    Ok(value) => (value, false),
+                    Err(error) => (json!({"error":error.message}), true),
+                };
+                self.emit_tool_result(&call, value.clone(), is_error, messages)
+                    .await;
+                if !is_error {
+                    self.agent
+                        .task_backend
+                        .as_ref()
+                        .unwrap()
+                        .acknowledge(&value)
+                        .await
+                        .map_err(|e| crate::extensions::invalid(&e.message))?;
+                }
+                continue;
+            }
             if let Some(child) = self.agent.handoff_by_tool_name(&call.name) {
                 self.execute_handoff(child, call, usage, messages).await?;
                 continue;
@@ -513,6 +558,86 @@ impl RunContext<'_> {
             self.execute_tools(batch, messages).await?;
         }
         Ok(())
+    }
+
+    async fn execute_task_control(
+        &self,
+        call: &ToolCall,
+    ) -> Result<Result<Value, crate::ToolError>, AgentError> {
+        let backend = self.agent.task_backend.as_ref().expect("task backend");
+        let spec = self.spec(&call.name).expect("task control spec");
+        if let Some(result) = self
+            .authorize(spec, &call.arguments, &ToolOrigin::Local)
+            .await?
+        {
+            return Ok(Err(crate::ToolError::new(result.to_string())));
+        }
+        let validate = |spec: &ToolSpec, args: &Value| -> Result<(), crate::ToolError> {
+            let validator = jsonschema::validator_for(&spec.input_schema)
+                .map_err(|e| crate::ToolError::new(e.to_string()))?;
+            validator
+                .validate(args)
+                .map_err(|e| crate::ToolError::new(e.to_string()))
+        };
+        if let Err(e) = validate(spec, &call.arguments) {
+            return Ok(Err(e));
+        }
+        if call.name != "run_tools" {
+            return Ok(backend.control(&call.name, call.arguments.clone()).await);
+        }
+        let requests: Vec<crate::TaskCall> =
+            match serde_json::from_value(call.arguments["calls"].clone()) {
+                Ok(calls) => calls,
+                Err(e) => return Ok(Err(crate::ToolError::new(e.to_string()))),
+            };
+        let mut submissions = Vec::new();
+        for (index, request) in requests.into_iter().enumerate() {
+            let Some(tool) = self.agent.tools.get(&request.tool) else {
+                return Ok(Err(crate::ToolError::new(format!(
+                    "Unknown task tool: {}",
+                    request.tool
+                ))));
+            };
+            if crate::task::is_task_control(&request.tool) {
+                return Ok(Err(crate::ToolError::new(
+                    "Recursive task controls are forbidden",
+                )));
+            }
+            let spec = self.spec(&request.tool).expect("registered tool");
+            if let Err(e) = validate(spec, &request.arguments) {
+                return Ok(Err(e));
+            }
+            if let Some(result) = self
+                .authorize(spec, &request.arguments, &tool.origin())
+                .await?
+            {
+                return Ok(Err(crate::ToolError::new(result.to_string())));
+            }
+            submissions.push(crate::TaskSubmission {
+                run_id: self.run_id,
+                call_id: call.id.clone(),
+                index,
+                request,
+                tool: tool.clone(),
+            });
+        }
+        let ids = match backend.submit(submissions).await {
+            Ok(ids) => ids,
+            Err(e) => return Ok(Err(e)),
+        };
+        let mode = call.arguments["yield_when"].as_str().unwrap_or("any");
+        let operation = if mode == "none" {
+            "get_tasks"
+        } else {
+            "wait_tools"
+        };
+        Ok(backend
+            .control(
+                operation,
+                json!({"task_ids":ids,"yield_when":mode,
+            "wait_timeout_secs":call.arguments["wait_timeout_secs"].as_u64().unwrap_or(30)}),
+            )
+            .await)
     }
 
     async fn execute_tools(
