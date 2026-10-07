@@ -212,7 +212,9 @@ impl Runtime {
         tracing::info!(%run_id, "agent run started");
         run.emit(RunEvent::Started { run_id }).await;
 
-        for turn in 1..=agent.limits.max_turns {
+        let mut turn = 0usize;
+        loop {
+            turn = turn.saturating_add(1);
             tracing::debug!(%run_id, turn, "requesting model response");
             run.emit(RunEvent::ModelStarted { run_id, turn }).await;
             let response = run
@@ -282,9 +284,6 @@ impl Runtime {
             tool_calls += charged;
             run.execute_calls(calls, &mut usage, messages).await?;
         }
-
-        tracing::warn!(%run_id, limit = agent.limits.max_turns, "maximum turn limit exceeded");
-        Err(AgentError::MaxTurnsExceeded(agent.limits.max_turns))
     }
 }
 

@@ -139,21 +139,21 @@ async fn executes_a_tool_and_sends_its_result_to_the_model() {
 }
 
 #[tokio::test]
-async fn stops_when_the_turn_limit_is_reached() {
-    let model = Arc::new(ScriptedModel::new([tool_call_response()]));
+async fn continues_beyond_the_former_turn_limit() {
+    let mut responses = vec![tool_call_response(); 40];
+    responses.push(ModelResponse::new(Message::assistant("done")));
+    let model = Arc::new(ScriptedModel::new(responses));
     let mut agent = Agent::new(model).with_limits(RunLimits {
-        max_turns: 1,
-        max_tool_calls: 10,
-        timeout: Duration::from_secs(1),
+        max_tool_calls: 40,
+        timeout: Duration::from_secs(5),
     });
     agent.register_tool(Arc::new(AddTool)).unwrap();
-
-    let error = Runtime::new()
+    let output = Runtime::new()
         .run(&agent, RunRequest::new(vec![Message::user("keep going")]))
         .await
-        .unwrap_err();
-
-    assert!(matches!(error, AgentError::MaxTurnsExceeded(1)));
+        .unwrap();
+    assert_eq!(output.turns, 41);
+    assert_eq!(output.tool_calls, 40);
 }
 
 struct PendingModel;

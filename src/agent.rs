@@ -11,7 +11,6 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RunLimits {
-    pub max_turns: usize,
     pub max_tool_calls: usize,
     pub timeout: Duration,
 }
@@ -19,7 +18,6 @@ pub struct RunLimits {
 impl Default for RunLimits {
     fn default() -> Self {
         Self {
-            max_turns: 16,
             max_tool_calls: 32,
             timeout: Duration::from_secs(120),
         }

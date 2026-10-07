@@ -12,7 +12,7 @@
 - 支持将任务 handoff 给具名子 Agent
 - 支持文本增量及运行生命周期事件
 - 支持 URL、data URL 和 OpenAI file ID 形式的图像输入
-- 支持最大轮数、最大工具调用数、超时和主动取消
+- 支持最大工具调用数、超时和主动取消
 - 通过 `Model`、`Tool`、`Policy` 和 `EventSink` trait 扩展运行时
 - 可选 `mcp` / `skills` feature：每次请求显式传配置，支持运行时替换，无目录扫描；见 [使用说明](docs/extensions.md)
 
@@ -211,14 +211,13 @@ let agent = Agent::new(model).with_policy(Arc::new(MyPolicy));
 
 也可以实现 `EventSink`，再通过 `with_event_sink` 将事件发送到日志、指标或审计系统。
 
-默认运行限制为 16 轮、32 次工具调用和 120 秒超时：
+不设模型轮数上限；默认限制为 32 次工具调用和 120 秒超时：
 
 ```rust
 use std::time::Duration;
 use g::RunLimits;
 
 let agent = Agent::new(model).with_limits(RunLimits {
-    max_turns: 8,
     max_tool_calls: 16,
     timeout: Duration::from_secs(60),
 });
