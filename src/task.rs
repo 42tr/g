@@ -35,6 +35,12 @@ pub struct TaskSubmission {
 
 #[async_trait]
 pub trait TaskBackend: Send + Sync {
+    /// Bind a child agent's explicitly configured backend to a handoff. Hosts
+    /// can use the stable call ID to isolate task ownership and recovery. A
+    /// backend is never inherited by children that did not configure one.
+    fn for_handoff(&self, _agent: &str, _call_id: &str) -> Option<Arc<dyn TaskBackend>> {
+        None
+    }
     async fn submit(&self, tasks: Vec<TaskSubmission>) -> Result<Vec<String>, ToolError>;
     async fn control(&self, operation: &str, arguments: Value) -> Result<Value, ToolError>;
     /// Called after the corresponding model tool response has reached the event sink.

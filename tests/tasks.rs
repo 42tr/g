@@ -94,6 +94,83 @@ fn model(responses: Vec<Message>) -> Arc<Script> {
 }
 
 #[tokio::test]
+async fn handoff_binds_only_the_childs_explicit_backend() {
+    struct Factory {
+        calls: Mutex<Vec<(String, String)>>,
+        child: Arc<Backend>,
+    }
+    #[async_trait]
+    impl TaskBackend for Factory {
+        fn for_handoff(&self, agent: &str, call_id: &str) -> Option<Arc<dyn TaskBackend>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((agent.into(), call_id.into()));
+            Some(self.child.clone())
+        }
+        async fn submit(&self, _: Vec<TaskSubmission>) -> Result<Vec<String>, ToolError> {
+            panic!("unbound child backend used")
+        }
+        async fn control(&self, _: &str, _: Value) -> Result<Value, ToolError> {
+            panic!("unbound child backend used")
+        }
+        async fn ready_to_finish(&self) -> Result<bool, ToolError> {
+            panic!("unbound child backend used")
+        }
+    }
+    let scoped = backend();
+    scoped.ready.store(true, Ordering::SeqCst);
+    let factory = Arc::new(Factory {
+        calls: Mutex::new(vec![]),
+        child: scoped.clone(),
+    });
+    let parent_backend = backend();
+    parent_backend.ready.store(true, Ordering::SeqCst);
+    let worker_model = model(vec![
+        call(
+            "batch",
+            "run_tools",
+            json!({
+                "calls":[{"tool":"lookup","arguments":{"id":1}}], "yield_when":"none"
+            }),
+        ),
+        Message::assistant("checked"),
+    ]);
+    let child = Agent::new(worker_model.clone())
+        .name("programmer")
+        .tool(Lookup)
+        .with_task_backend(factory.clone());
+    let plain_model = model(vec![Message::assistant("plain answer")]);
+    let parent = Agent::new(model(vec![
+        call("h1", "handoff_to_programmer", json!({"task":"work"})),
+        call("h2", "handoff_to_plain", json!({"task":"read"})),
+        Message::assistant("done"),
+    ]))
+    .with_task_backend(parent_backend.clone())
+    .handoff([child, Agent::new(plain_model.clone()).name("plain")]);
+    assert_eq!(parent.run("start").await.unwrap().final_text, "done");
+    assert_eq!(
+        *factory.calls.lock().unwrap(),
+        [("programmer".into(), "h1".into())]
+    );
+    assert_eq!(scoped.submitted.load(Ordering::SeqCst), 1);
+    assert_eq!(scoped.acknowledged.load(Ordering::SeqCst), 1);
+    assert_eq!(parent_backend.submitted.load(Ordering::SeqCst), 0);
+    assert!(
+        worker_model.requests.lock().unwrap()[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "run_tools")
+    );
+    assert!(
+        !plain_model.requests.lock().unwrap()[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "run_tools")
+    );
+}
+
+#[tokio::test]
 async fn receives_partial_results_then_detaches_before_finishing() {
     let backend = backend();
     let model = model(vec![

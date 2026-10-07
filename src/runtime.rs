@@ -730,6 +730,11 @@ impl RunContext<'_> {
         .await;
 
         let mut child_agent = child.as_ref().clone();
+        if let Some(backend) = &child_agent.task_backend {
+            if let Some(scoped) = backend.for_handoff(child_name, &call.id) {
+                child_agent.task_backend = Some(scoped);
+            }
+        }
         child_agent.event_sink = self.agent.event_sink.clone();
         child_agent.policy = Arc::new(crate::extensions::PolicyIntersection(
             self.agent.policy.clone(),
