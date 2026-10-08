@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use uuid::Uuid;
 
-pub const TASK_INSTRUCTION: &str = "\nTask execution: use run_tools to start independent tools concurrently. Every call must include a concise, human-readable title in the user's language, describing the action and its target (for example, 检查 RDP 会话状态 or 运行项目测试 for Chinese conversations). Titles appear in the execution workflow; never use only a tool name such as command, a raw shell command, or a vague label. Its response may contain pending task IDs. Use wait_tools to receive results (timeouts only end the wait), get_tasks to inspect progress, cancel_tools to stop unnecessary tasks, and detach_tools to let tasks continue after your reply. Never claim a pending task succeeded. Before finishing, receive required results and detach or cancel remaining tasks. command runs CLI programs including codex/claude; use noninteractive commands. Do not repeatedly poll without waiting. Parent task IDs denote actual subtasks, not mere dependencies.\n";
+pub const TASK_INSTRUCTION: &str = "\nTask execution: use run_tools to start independent tools concurrently. Every call must include a concise, human-readable title in the user's language, describing the action and its target (for example, 检查 RDP 会话状态 or 运行项目测试 for Chinese conversations). Titles appear in the execution workflow; never use only a tool name or a raw shell command. Its response may contain pending task IDs. Use wait_tools to receive results (timeouts only end the wait). Use get_tasks with specific task_ids when progress or output is needed; an empty query is only a bounded overview of tasks needing attention. Do not reread completed history unless it is relevant to the user's request. Never claim a pending task succeeded. Before finishing, receive required results and detach or cancel remaining attached tasks. Preserve already detached work; do not cancel a background session needed for user confirmation just to clean up. command runs noninteractive CLI programs. Do not repeatedly poll without waiting. Parent task IDs denote actual subtasks, not mere dependencies.\n";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -49,6 +49,10 @@ pub trait TaskBackend: Send + Sync {
     }
     /// True only when required results were delivered and no attached task is active.
     async fn ready_to_finish(&self) -> Result<bool, ToolError>;
+    /// Bounded task identifiers/statuses for actionable completion feedback.
+    async fn finish_blockers(&self) -> Result<Value, ToolError> {
+        Ok(Value::Null)
+    }
 }
 
 pub fn is_task_control(name: &str) -> bool {
@@ -73,7 +77,12 @@ pub(crate) fn task_specs() -> Vec<ToolSpec> {
         ("wait_tools", "Receive task results; waiting does not cancel tasks. Defaults to any result, 30 seconds.", json!({"type":"object","properties":{
             "task_ids":ids,"yield_when":{"type":"string","enum":["any","all"]},"wait_timeout_secs":wait
         },"required":["task_ids"],"additionalProperties":false})),
-        ("get_tasks", "Read task status, recent output and results. Omit IDs to list this conversation's tasks.", json!({"type":"object","properties":{"task_ids":ids},"additionalProperties":false})),
+        ("get_tasks", "Read bounded task status/results. Prefer specific task_ids to inspect output. Without IDs, return a paged overview of active tasks, this reply's unreceived results and unacknowledged unknown tasks; completed history is excluded. Use include_history only for a relevant historical lookup, with next_offset for pagination. Default limit 32, maximum 64. Output/result previews may be truncated; consult task details or saved result files for longer content.", json!({"type":"object","properties":{
+            "task_ids":ids,"include_history":{"type":"boolean","default":false},
+            "include_output":{"type":"boolean","description":"Include recent output previews. Defaults to true with task_ids; false for overview queries, except required unreceived results."},
+            "limit":{"type":"integer","minimum":1,"maximum":64,"default":32},
+            "offset":{"type":"integer","minimum":0,"description":"Pagination offset for historical lookups. For attention queries repeat without offset after receiving results."}
+        },"additionalProperties":false})),
         ("detach_tools", "Allow selected tasks to continue after this reply finishes or is stopped.", json!({"type":"object","properties":{"task_ids":ids},"required":["task_ids"],"additionalProperties":false})),
         ("cancel_tools", "Cancel selected tasks and their descendants. Cancellation does not undo side effects.", json!({"type":"object","properties":{"task_ids":ids,"reason":{"type":"string"}},"required":["task_ids"],"additionalProperties":false})),
     ].into_iter().map(|(name, description, input_schema)| ToolSpec {

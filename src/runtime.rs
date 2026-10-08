@@ -245,7 +245,11 @@ impl Runtime {
                         .await
                         .map_err(|e| crate::extensions::invalid(&e.message))?
                     {
-                        messages.push(Message::system("Tasks remain attached or completed results have not been received. Use wait_tools/get_tasks to receive required results, detach_tools for background work, or cancel_tools. Your preceding text is a progress update, not a final reply."));
+                        let blockers = backend.finish_blockers().await
+                            .map_err(|e| crate::extensions::invalid(&e.message))?;
+                        messages.push(Message::system(format!(
+                            "Tasks remain attached or required results have not been received. Handle only these blockers using their exact task_ids: wait_tools/get_tasks to receive results, detach_tools for authorized background work, or cancel_tools for unnecessary attached tasks. Preserve already detached sessions needed for user confirmation; do not clean up unrelated historical tasks. If has_more is true, handle this batch then inspect remaining blockers. Your preceding text is a progress update, not a final reply. Completion blockers: {blockers}"
+                        )));
                         continue;
                     }
                 }
