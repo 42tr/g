@@ -591,6 +591,11 @@ impl RunContext<'_> {
             };
         let mut submissions = Vec::new();
         for (index, request) in requests.into_iter().enumerate() {
+            if request.title.as_deref().unwrap_or_default().trim().is_empty() {
+                return Ok(Err(crate::ToolError::new(
+                    "Every task must include a nonblank title describing its action and target",
+                )));
+            }
             let Some(tool) = self.agent.tools.get(&request.tool) else {
                 return Ok(Err(crate::ToolError::new(format!(
                     "Unknown task tool: {}",

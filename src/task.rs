@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use uuid::Uuid;
 
-pub const TASK_INSTRUCTION: &str = "\nTask execution: use run_tools to start independent tools concurrently. Its response may contain pending task IDs. Use wait_tools to receive results (timeouts only end the wait), get_tasks to inspect progress, cancel_tools to stop unnecessary tasks, and detach_tools to let tasks continue after your reply. Never claim a pending task succeeded. Before finishing, receive required results and detach or cancel remaining tasks. command runs CLI programs including codex/claude; use noninteractive commands. Do not repeatedly poll without waiting. Parent task IDs denote actual subtasks, not mere dependencies.\n";
+pub const TASK_INSTRUCTION: &str = "\nTask execution: use run_tools to start independent tools concurrently. Every call must include a concise, human-readable title in the user's language, describing the action and its target (for example, 检查 RDP 会话状态 or 运行项目测试 for Chinese conversations). Titles appear in the execution workflow; never use only a tool name such as command, a raw shell command, or a vague label. Its response may contain pending task IDs. Use wait_tools to receive results (timeouts only end the wait), get_tasks to inspect progress, cancel_tools to stop unnecessary tasks, and detach_tools to let tasks continue after your reply. Never claim a pending task succeeded. Before finishing, receive required results and detach or cancel remaining tasks. command runs CLI programs including codex/claude; use noninteractive commands. Do not repeatedly poll without waiting. Parent task IDs denote actual subtasks, not mere dependencies.\n";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -65,9 +65,9 @@ pub(crate) fn task_specs() -> Vec<ToolSpec> {
         ("run_tools", "Submit tools as host-owned tasks. Wait for any/all result or return immediately. Each actual call counts against the tool budget.", json!({
             "type":"object", "properties": {
                 "calls":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{
-                    "tool":{"type":"string"},"arguments":{"type":"object"},"title":{"type":"string","maxLength":200},
+                    "tool":{"type":"string"},"arguments":{"type":"object"},"title":{"type":"string","minLength":1,"maxLength":200,"pattern":"\\S","description":"Required workflow title in the user's language: a concise action and target, such as 检查 RDP 会话状态. Do not use just the tool name or a raw shell command."},
                     "parent_task_id":{"type":"string"},"execution_timeout_secs":{"type":"integer","minimum":1}
-                },"required":["tool","arguments"],"additionalProperties":false}},
+                },"required":["tool","arguments","title"],"additionalProperties":false}},
                 "yield_when":{"type":"string","enum":["none","any","all"]},"wait_timeout_secs":wait
             },"required":["calls"],"additionalProperties":false})),
         ("wait_tools", "Receive task results; waiting does not cancel tasks. Defaults to any result, 30 seconds.", json!({"type":"object","properties":{

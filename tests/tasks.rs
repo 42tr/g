@@ -131,7 +131,7 @@ async fn handoff_binds_only_the_childs_explicit_backend() {
             "batch",
             "run_tools",
             json!({
-                "calls":[{"tool":"lookup","arguments":{"id":1}}], "yield_when":"none"
+                "calls":[{"tool":"lookup","arguments":{"id":1},"title":"查询记录 1"}], "yield_when":"none"
             }),
         ),
         Message::assistant("checked"),
@@ -177,7 +177,7 @@ async fn receives_partial_results_then_detaches_before_finishing() {
         call(
             "batch",
             "run_tools",
-            json!({"calls":[{"tool":"lookup","arguments":{"id":1}},{"tool":"lookup","arguments":{"id":2}}]}),
+            json!({"calls":[{"tool":"lookup","arguments":{"id":1},"title":"查询记录 1"},{"tool":"lookup","arguments":{"id":2},"title":"查询记录 2"}]}),
         ),
         Message::assistant("progress"),
         call("detach", "detach_tools", json!({"task_ids":["t1"]})),
@@ -208,6 +208,45 @@ async fn receives_partial_results_then_detaches_before_finishing() {
 }
 
 #[tokio::test]
+async fn invalid_workflow_titles_can_be_corrected_before_submission() {
+    let mut invalid_calls = vec![json!({"tool":"lookup","arguments":{"id":2}})];
+    for title in [
+        Value::Null,
+        json!(""),
+        json!(" \t\n\u{3000}"),
+        json!("检".repeat(201)),
+    ] {
+        invalid_calls.push(json!({"tool":"lookup","arguments":{"id":2},"title":title}));
+    }
+    for invalid in invalid_calls {
+        let backend = backend();
+        backend.ready.store(true, Ordering::SeqCst);
+        let valid = json!({"tool":"lookup","arguments":{"id":1},"title":"检查 RDP 会话状态"});
+        let model = model(vec![
+            call(
+                "invalid",
+                "run_tools",
+                json!({"calls":[valid.clone(), invalid]}),
+            ),
+            call("corrected", "run_tools", json!({"calls":[valid]})),
+            Message::assistant("checked"),
+        ]);
+        let output = Agent::new(model.clone())
+            .tool(Lookup)
+            .with_task_backend(backend.clone())
+            .run("检查会话")
+            .await
+            .unwrap();
+        assert_eq!(output.final_text, "checked");
+        // The first batch must not partially submit its valid call.
+        assert_eq!(backend.submitted.load(Ordering::SeqCst), 1);
+        assert!(model.requests.lock().unwrap()[1].messages.iter()
+            .flat_map(|message| &message.content)
+            .any(|content| matches!(content, Content::ToolResult { call_id, is_error: true, .. } if call_id == "invalid")));
+    }
+}
+
+#[tokio::test]
 async fn malformed_nested_tool_never_reaches_backend() {
     let backend = backend();
     backend.ready.store(true, Ordering::SeqCst);
@@ -215,7 +254,7 @@ async fn malformed_nested_tool_never_reaches_backend() {
         call(
             "batch",
             "run_tools",
-            json!({"calls":[{"tool":"lookup","arguments":{"id":"bad"}}]}),
+            json!({"calls":[{"tool":"lookup","arguments":{"id":"bad"},"title":"查询记录"}]}),
         ),
         Message::assistant("invalid"),
     ]);
@@ -244,7 +283,7 @@ async fn nested_tools_are_charged_before_submission() {
     let model = model(vec![call(
         "batch",
         "run_tools",
-        json!({"calls":[{"tool":"lookup","arguments":{"id":1}}]}),
+        json!({"calls":[{"tool":"lookup","arguments":{"id":1},"title":"查询记录 1"}]}),
     )]);
     let result = Runtime::new()
         .run(
@@ -284,7 +323,7 @@ async fn task_wrapper_cannot_bypass_original_tool_policy() {
     let model = model(vec![call(
         "batch",
         "run_tools",
-        json!({"calls":[{"tool":"lookup","arguments":{"id":1}}]}),
+        json!({"calls":[{"tool":"lookup","arguments":{"id":1},"title":"查询记录 1"}]}),
     )]);
     let result = Runtime::new()
         .run(
