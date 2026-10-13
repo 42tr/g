@@ -4,7 +4,7 @@ use std::{
 };
 
 use futures_util::StreamExt;
-use g::{Agent, OpenAIChatModel, RunEvent, ToolCallError, tool};
+use glow_agent::{Agent, OpenAIChatModel, RunEvent, ToolCallError, tool};
 use serde_json::{Value, json};
 
 #[tool(name = "add", description = "Add two integers")]

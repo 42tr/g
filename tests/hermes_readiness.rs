@@ -11,7 +11,7 @@ use std::{
 
 use async_trait::async_trait;
 use futures_util::future::join_all;
-use g::{
+use glow_agent::{
     Agent, AgentError, Content, Message, Model, ModelError, ModelRequest, ModelResponse, Policy,
     PolicyError, Role, RunLimits, RunRequest, Runtime, Tool, ToolBehavior, ToolContext, ToolError,
     ToolSpec,

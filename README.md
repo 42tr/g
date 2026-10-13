@@ -1,6 +1,6 @@
-# g
+# Glow
 
-`g` 是一个轻量的 Rust Agent 运行时。它负责在模型、工具和子 Agent 之间驱动多轮对话，并提供流式事件、工具调用策略、运行限额、取消以及图像输入等基础能力。
+`glow-agent` 是一个轻量的 Rust Agent 运行时。它负责在模型、工具和子 Agent 之间驱动多轮对话，并提供流式事件、工具调用策略、运行限额、取消以及图像输入等基础能力。
 
 目前内置两个 OpenAI 模型适配器：`OpenAIModel` 基于 Responses API，`OpenAIChatModel` 基于 Chat Completions API；同时也可以通过实现 `Model` trait 接入其他模型。
 
@@ -35,10 +35,10 @@ export OPENAI_BASE_URL="https://api.openai.com/v1"
 
 `OPENAI_BASE_URL` 应指向 API 的 `/v1` 根路径。`OpenAIModel` 会向其下的 `/responses` 发起请求，`OpenAIChatModel` 会向其下的 `/chat/completions` 发起请求。
 
-如果希望通过单一入口根据 `OPENAI_TYPE` 自动选择接口，可以使用 `g::openai_from_env()`：
+如果希望通过单一入口根据 `OPENAI_TYPE` 自动选择接口，可以使用 `glow_agent::openai_from_env()`：
 
 ```rust
-use g::{openai_from_env, Agent};
+use glow_agent::{openai_from_env, Agent};
 use std::sync::Arc;
 
 let model = openai_from_env()?;
@@ -57,11 +57,33 @@ cargo run --example calculator
 
 ```toml
 [dependencies]
-g = { git = "https://github.com/42tr/g.git" }
+glow-agent = { git = "https://github.com/42tr/g.git" }
 futures-util = "0.3"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt"] }
 ```
+
+发布到 crates.io 后，可改用版本依赖：
+
+```toml
+[dependencies]
+glow-agent = "0.1.0"
+```
+
+本仓库包含 `glow-agent` 运行时和 `glow-agent-macros` 过程宏两个包。
+应用只需依赖运行时，Cargo 会自动下载配套宏包；`tool` 宏从
+`glow_agent::tool` 统一导出。
+
+从原来的 `g` 包迁移时，可保留依赖别名，让现有的 `g::Agent`、`g::tool`
+调用继续使用：
+
+```toml
+[dependencies]
+g = { package = "glow-agent", version = "0.1.0" }
+```
+
+Git 依赖或本地 `path` 依赖同样可以保留 `g` 别名，但也需要指定
+`package = "glow-agent"`。
 
 下面的例子声明了一个加法工具，并以流式方式输出模型回复：
 
@@ -72,7 +94,7 @@ use std::{
 };
 
 use futures_util::StreamExt;
-use g::{tool, Agent, OpenAIModel, RunEvent, ToolCallError};
+use glow_agent::{tool, Agent, OpenAIModel, RunEvent, ToolCallError};
 use serde_json::{json, Value};
 
 #[tool(name = "add", description = "Add two integers")]
@@ -175,7 +197,7 @@ Handoff 会继承父运行的取消信号和事件接收器，并复用父运行
 将文本和图像内容组合后直接传给 `run` 或 `stream_run`：
 
 ```rust
-use g::{Content, ImageDetail};
+use glow_agent::{Content, ImageDetail};
 
 let prompt = [
     Content::text("Describe this image in one sentence."),
@@ -215,7 +237,7 @@ let agent = Agent::new(model).with_policy(Arc::new(MyPolicy));
 
 ```rust
 use std::time::Duration;
-use g::RunLimits;
+use glow_agent::RunLimits;
 
 let agent = Agent::new(model).with_limits(RunLimits {
     max_tool_calls: 16,
@@ -246,7 +268,7 @@ cargo run --example handoff
 设置 `RUST_LOG` 可以查看运行日志：
 
 ```bash
-RUST_LOG=g=debug cargo run --example calculator
+RUST_LOG=glow_agent=debug cargo run --example calculator
 ```
 
 ## 开发
@@ -256,3 +278,46 @@ cargo fmt --check
 cargo test --workspace
 cargo clippy --workspace --all-targets
 ```
+
+## 发布
+
+两个包保持相同版本号，运行时通过精确版本依赖配套宏包。发布前在两个
+`Cargo.toml` 中更新版本号和宏依赖版本，并运行测试：
+
+```bash
+cargo fmt --all --check
+cargo test --workspace --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked
+```
+
+使用支持 workspace 发布的 Cargo；本次验证工具链为 Cargo 1.97.1。
+脚本默认只做打包和编译预检，不上传，Cargo 会按依赖顺序处理两个包：
+
+```bash
+sh scripts/publish.sh
+# 审阅尚未提交的本地改动时
+sh scripts/publish.sh --allow-dirty
+```
+
+确认预检通过、发布改动已提交，并配置好 crates.io 发布凭据后，显式执行：
+
+```bash
+sh scripts/publish.sh --publish
+```
+
+脚本指定 `--registry crates-io`，避免本地下载镜像影响发布目标。
+
+首次同时预检两个尚未发布的包时，配置了 `source.crates-io.replace-with`
+的下载镜像可能使 Cargo 无法找到刚打包的宏包。此时使用独立 Cargo
+缓存目录，直接访问 crates.io，不必修改全局配置：
+
+```bash
+CARGO_HOME="$PWD/target/publish-cargo-home" sh scripts/publish.sh --allow-dirty
+```
+
+正式发布也使用该目录时，需要先在同一 `CARGO_HOME` 下配置发布凭据。
+
+## 许可证
+
+本项目采用 `MIT OR Apache-2.0` 双许可证，由使用者任选其一。
+完整文本见 [LICENSE-MIT](LICENSE-MIT) 和 [LICENSE-APACHE](LICENSE-APACHE)。

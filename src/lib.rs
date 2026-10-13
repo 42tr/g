@@ -1,4 +1,4 @@
-extern crate self as g;
+extern crate self as glow_agent;
 
 mod agent;
 mod error;
@@ -21,7 +21,7 @@ pub use agent::{Agent, PolicyDenial, RetryPolicy, RunLimits};
 pub use error::{AgentError, ModelError, PolicyError, ToolError};
 pub use event::{EventSink, NoopEventSink, RunEvent};
 pub use extensions::{ContextManifest, ExtensionConfig, InvocationScope, ToolOrigin, WarmupReport};
-pub use g_macros::tool;
+pub use glow_agent_macros::tool;
 pub use message::{Content, ImageDetail, ImageSource, IntoPrompt, Message, Role};
 pub use model::{Model, ModelEvent, ModelEventSink, ModelRequest, ModelResponse, Usage};
 pub use policy::{AllowAll, Policy};

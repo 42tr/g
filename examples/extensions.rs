@@ -1,6 +1,6 @@
 //! Run with: cargo run --example extensions --features mcp,skills
 //! The application supplies JSON in G_EXTENSIONS_JSON; the library never reads it.
-use g::{Agent, ExtensionConfig, Message, RunRequest, Runtime, mcp::McpManager};
+use glow_agent::{Agent, ExtensionConfig, Message, RunRequest, Runtime, mcp::McpManager};
 use std::sync::Arc;
 
 #[tokio::main(flavor = "current_thread")]
@@ -11,8 +11,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
     )?;
     config.validate()?;
-    let agent =
-        Agent::new(g::openai_from_env()?).instruction("Use the configured skills when relevant.");
+    let agent = Agent::new(glow_agent::openai_from_env()?)
+        .instruction("Use the configured skills when relevant.");
     let manager = Arc::new(McpManager::anonymous());
     let runtime = Runtime::new().with_mcp_manager(manager.clone());
     let request = RunRequest::new(vec![Message::user("Explain how you would analyze a task.")])

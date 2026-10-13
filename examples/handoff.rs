@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use g::{Agent, OpenAIModel, ToolCallError, tool};
+use glow_agent::{Agent, OpenAIModel, ToolCallError, tool};
 use serde_json::{Value, json};
 
 #[tool(name = "add", description = "Add two integers")]

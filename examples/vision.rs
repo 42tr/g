@@ -4,7 +4,7 @@ use std::{
 };
 
 use futures_util::StreamExt;
-use g::{Agent, Content, ImageDetail, OpenAIModel, RunEvent};
+use glow_agent::{Agent, Content, ImageDetail, OpenAIModel, RunEvent};
 
 const IMAGE_URL: &str =
     "https://api.nga.gov/iiif/a2e6da57-3cd1-4235-b20e-95dcaefed6c8/full/!800,800/0/default.jpg";

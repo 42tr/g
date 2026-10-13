@@ -1,7 +1,14 @@
 [package]
-name = "g-macros"
+name = "glow-agent-macros"
 version = "0.1.0"
 edition = "2024"
+description = "Attribute macros for declaring Rust agent tools"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/42tr/g"
+readme = "README.md"
+keywords = ["agent", "tools", "proc-macro"]
+categories = ["development-tools::procedural-macro-helpers"]
+publish = ["crates-io"]
 
 [lib]
 proc-macro = true

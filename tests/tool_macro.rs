@@ -1,4 +1,4 @@
-use g::{Tool, ToolCallError, ToolContext, tool};
+use glow_agent::{Tool, ToolCallError, ToolContext, tool};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;

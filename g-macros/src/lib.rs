@@ -280,11 +280,11 @@ fn last_segment_is(ty: &Type, name: &str) -> bool {
 }
 
 fn runtime_crate() -> TokenStream2 {
-    match crate_name("g") {
+    match crate_name("glow-agent") {
         Ok(FoundCrate::Name(name)) => {
             let name = format_ident!("{name}");
             quote!(::#name)
         }
-        Ok(FoundCrate::Itself) | Err(_) => quote!(::g),
+        Ok(FoundCrate::Itself) | Err(_) => quote!(::glow_agent),
     }
 }

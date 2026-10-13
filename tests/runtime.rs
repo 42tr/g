@@ -6,7 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use g::{
+use glow_agent::{
     Agent, AgentError, Content, Message, Model, ModelError, ModelRequest, ModelResponse, Role,
     RunLimits, RunRequest, Runtime, Tool, ToolBehavior, ToolContext, ToolError, ToolSpec,
 };
@@ -250,8 +250,8 @@ async fn streams_text_and_lifecycle_events() {
 
     while let Some(event) = stream.next().await {
         match event.unwrap() {
-            g::RunEvent::TextDelta { text: delta, .. } => text.push_str(&delta),
-            g::RunEvent::Completed { .. } => completed = true,
+            glow_agent::RunEvent::TextDelta { text: delta, .. } => text.push_str(&delta),
+            glow_agent::RunEvent::Completed { .. } => completed = true,
             _ => {}
         }
     }
@@ -352,7 +352,7 @@ async fn retries_retryable_model_errors() {
         ])),
         requests: Mutex::new(Vec::new()),
     });
-    let agent = Agent::new(model.clone()).with_retry_policy(g::RetryPolicy {
+    let agent = Agent::new(model.clone()).with_retry_policy(glow_agent::RetryPolicy {
         max_retries: 1,
         initial_backoff: Duration::from_millis(1),
         max_backoff: Duration::from_millis(1),
@@ -381,15 +381,15 @@ async fn does_not_retry_non_retryable_model_errors() {
 struct DenyAdd;
 
 #[async_trait]
-impl g::Policy for DenyAdd {
+impl glow_agent::Policy for DenyAdd {
     async fn authorize(
         &self,
         _context: &ToolContext,
         tool: &ToolSpec,
         _arguments: &Value,
-    ) -> Result<(), g::PolicyError> {
+    ) -> Result<(), glow_agent::PolicyError> {
         if tool.name == "add" {
-            return Err(g::PolicyError::new("add is not allowed"));
+            return Err(glow_agent::PolicyError::new("add is not allowed"));
         }
         Ok(())
     }
@@ -404,7 +404,7 @@ async fn can_report_policy_denials_to_the_model() {
     let agent = Agent::new(model.clone())
         .tools([AddTool])
         .with_policy(Arc::new(DenyAdd))
-        .on_policy_denial(g::PolicyDenial::ReportToModel);
+        .on_policy_denial(glow_agent::PolicyDenial::ReportToModel);
 
     let output = agent.run("What is 20 + 22?").await.unwrap();
 
@@ -435,14 +435,14 @@ async fn stream_ends_with_the_run_output_and_events_carry_the_run_id() {
         .collect()
         .await;
 
-    let g::RunEvent::Started { run_id } = &events[0] else {
+    let glow_agent::RunEvent::Started { run_id } = &events[0] else {
         panic!("first event must be Started");
     };
     assert!(events.iter().any(|event| matches!(
         event,
-        g::RunEvent::ToolCompleted { run_id: id, .. } if id == run_id
+        glow_agent::RunEvent::ToolCompleted { run_id: id, .. } if id == run_id
     )));
-    let Some(g::RunEvent::Finished { output }) = events.last() else {
+    let Some(glow_agent::RunEvent::Finished { output }) = events.last() else {
         panic!("last event must be Finished");
     };
     assert_eq!(output.run_id, *run_id);
@@ -452,15 +452,15 @@ async fn stream_ends_with_the_run_output_and_events_carry_the_run_id() {
 
 #[tokio::test]
 async fn handoff_is_authorized_with_a_handoff_origin() {
-    struct RecordOrigin(Mutex<Vec<g::ToolOrigin>>);
+    struct RecordOrigin(Mutex<Vec<glow_agent::ToolOrigin>>);
     #[async_trait]
-    impl g::Policy for RecordOrigin {
+    impl glow_agent::Policy for RecordOrigin {
         async fn authorize(
             &self,
             _: &ToolContext,
             _: &ToolSpec,
             _: &Value,
-        ) -> Result<(), g::PolicyError> {
+        ) -> Result<(), glow_agent::PolicyError> {
             Ok(())
         }
         async fn authorize_extension(
@@ -468,9 +468,9 @@ async fn handoff_is_authorized_with_a_handoff_origin() {
             _: &ToolContext,
             _: &ToolSpec,
             _: &Value,
-            origin: &g::ToolOrigin,
-            _: &g::InvocationScope,
-        ) -> Result<(), g::PolicyError> {
+            origin: &glow_agent::ToolOrigin,
+            _: &glow_agent::InvocationScope,
+        ) -> Result<(), glow_agent::PolicyError> {
             self.0.lock().unwrap().push(origin.clone());
             Ok(())
         }
@@ -500,7 +500,7 @@ async fn handoff_is_authorized_with_a_handoff_origin() {
 
     assert_eq!(
         *policy.0.lock().unwrap(),
-        vec![g::ToolOrigin::Handoff {
+        vec![glow_agent::ToolOrigin::Handoff {
             agent: "math".into()
         }]
     );

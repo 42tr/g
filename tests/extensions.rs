@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 #[cfg(any(feature = "skills", feature = "mcp"))]
-use g::ExtensionConfig;
-use g::{
+use glow_agent::ExtensionConfig;
+use glow_agent::{
     Agent, Content, Message, Model, ModelError, ModelRequest, ModelResponse, Role, RunRequest,
     Runtime,
 };
@@ -45,7 +45,7 @@ impl Model for Script {
     }
 }
 #[cfg(any(feature = "skills", feature = "mcp"))]
-fn tool_result(output: &g::RunOutput, index: usize) -> (&Value, bool) {
+fn tool_result(output: &glow_agent::RunOutput, index: usize) -> (&Value, bool) {
     output
         .messages
         .iter()
@@ -85,7 +85,7 @@ async fn composed_history_can_be_resumed_without_duplicate_instructions() {
 #[cfg(feature = "skills")]
 mod skills {
     use super::*;
-    use g::{
+    use glow_agent::{
         Policy, PolicyError, ToolContext, ToolSpec,
         skills::{SkillDefinition, SkillResource},
     };
@@ -257,7 +257,7 @@ mod skills {
                         .with_selected_skills(["analysis"])
                 )
                 .await,
-            Err(g::AgentError::Policy(_))
+            Err(glow_agent::AgentError::Policy(_))
         ));
         let agent = Agent::new(Script::new(vec![(
             "skills_read".into(),
@@ -271,7 +271,7 @@ mod skills {
                     RunRequest::new(vec![]).with_extensions(config("secret"))
                 )
                 .await,
-            Err(g::AgentError::Policy(_))
+            Err(glow_agent::AgentError::Policy(_))
         ));
     }
     #[tokio::test]
@@ -326,7 +326,7 @@ mod skills {
 #[cfg(feature = "mcp")]
 mod mcp {
     use super::*;
-    use g::{
+    use glow_agent::{
         InvocationScope,
         mcp::{CredentialProvider, McpCredentials, McpManager, McpServerConfig, McpTransport},
     };
@@ -363,7 +363,7 @@ mod mcp {
         scope: InvocationScope,
         tool: &str,
         args: Value,
-    ) -> g::RunOutput {
+    ) -> glow_agent::RunOutput {
         let model = Script::new(vec![(format!("mcp__fixture__{tool}"), args)]);
         runtime
             .run(
@@ -456,7 +456,7 @@ mod mcp {
             &self,
             scope: &InvocationScope,
             _: Option<&str>,
-        ) -> Result<McpCredentials, g::AgentError> {
+        ) -> Result<McpCredentials, glow_agent::AgentError> {
             Ok(McpCredentials {
                 bearer_token: Some(scope.id.clone()),
                 ..Default::default()
@@ -571,9 +571,12 @@ mod mcp {
     async fn reads_skill_then_calls_mcp_in_the_same_run() {
         let manager = Arc::new(McpManager::anonymous());
         let runtime = Runtime::new().with_mcp_manager(manager.clone());
-        let mut skill =
-            g::skills::SkillDefinition::new("analysis", "Analyze", "Call the fixture echo tool");
-        skill.required_tools.push(g::ToolOrigin::Mcp {
+        let mut skill = glow_agent::skills::SkillDefinition::new(
+            "analysis",
+            "Analyze",
+            "Call the fixture echo tool",
+        );
+        skill.required_tools.push(glow_agent::ToolOrigin::Mcp {
             server_id: "fixture".into(),
             tool_name: "echo".into(),
         });
@@ -626,7 +629,7 @@ mod mcp {
                 .await
         };
         let (first, second) = tokio::join!(first, second);
-        assert!(matches!(first, Err(g::AgentError::Cancelled)));
+        assert!(matches!(first, Err(glow_agent::AgentError::Cancelled)));
         assert_eq!(second.unwrap().tools.len(), 2);
         let out = invoke(
             &runtime,
@@ -689,7 +692,7 @@ mod mcp {
                 token.cancel();
             };
             let (result, _) = tokio::join!(runtime.run(&agent, request), cancel);
-            assert!(matches!(result, Err(g::AgentError::Cancelled)));
+            assert!(matches!(result, Err(glow_agent::AgentError::Cancelled)));
         };
         let (out, _) = tokio::join!(first, second);
         assert_eq!(tool_result(&out, 0).0["structured_content"]["calls"], 1);

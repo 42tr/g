@@ -3,18 +3,18 @@
 启用可选 feature；原有本地 Tool 无需修改：
 
 ```toml
-g = { git = "https://github.com/42tr/g.git", features = ["mcp", "skills"] }
+glow-agent = { git = "https://github.com/42tr/g.git", features = ["mcp", "skills"] }
 ```
 
-g 不扫描目录，不读取 MCP/skills 配置文件，不监听文件变化。调用方构造 `ExtensionConfig` 或自行反序列化 JSON，随每个 `RunRequest` 传入。省略配置或传空列表表示本次禁用；不会继承上一个请求的能力。
+Glow 不扫描目录，不读取 MCP/skills 配置文件，不监听文件变化。调用方构造 `ExtensionConfig` 或自行反序列化 JSON，随每个 `RunRequest` 传入。省略配置或传空列表表示本次禁用；不会继承上一个请求的能力。
 
 ## 使用
 
 ```rust
 use std::sync::Arc;
-use g::{Agent, ExtensionConfig, Message, RunRequest, Runtime};
-use g::mcp::{McpManager, McpServerConfig};
-use g::skills::{SkillDefinition, SkillResource};
+use glow_agent::{Agent, ExtensionConfig, Message, RunRequest, Runtime};
+use glow_agent::mcp::{McpManager, McpServerConfig};
+use glow_agent::skills::{SkillDefinition, SkillResource};
 
 // model 由宿主提供；manager 可供多个 Agent、多个并发请求共享。
 let agent = Agent::new(model);
@@ -77,7 +77,7 @@ stdio 传 `McpTransport::Stdio { command, args, cwd, env }`，command/cwd 必须
 
 ## 更新、续聊与兼容性
 
-每次调用传完整快照。宿主可以运行中生成新 Arc<ExtensionConfig>，交给新请求；旧 run 使用旧正文、资源和工具表。Arc 中为普通拥有所有权的数据，g 没有读取共享可变“当前配置”的接口。handoff 继承父请求快照，权限由父子 Policy 共同约束。配置删除不是对已执行操作的撤销；紧急停止由宿主收紧 Policy 或取消受影响 run。
+每次调用传完整快照。宿主可以运行中生成新 Arc<ExtensionConfig>，交给新请求；旧 run 使用旧正文、资源和工具表。Arc 中为普通拥有所有权的数据，Glow 没有读取共享可变“当前配置”的接口。handoff 继承父请求快照，权限由父子 Policy 共同约束。配置删除不是对已执行操作的撤销；紧急停止由宿主收紧 Policy 或取消受影响 run。
 
 Runtime.run 现在默认 Compose：统一加入 Agent instruction 和技能索引。RunOutput.messages 保留本次有效上下文；持久化 `conversation_messages` 用于下一次运行，避免重复追加托管提示词。完整回放已组装的 messages 可选 InstructionsMode::Preserve；这只改变提示词组装，不跳过工具装配或授权。Preserve 模式下不会重新注入显式选中技能，需提供已组装上下文。历史中的旧工具结果仍是过去的事实，不授予新 run 能力。
 
