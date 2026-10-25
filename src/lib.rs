@@ -6,10 +6,6 @@ mod context_model;
 mod error;
 mod event;
 mod extensions;
-#[cfg(all(feature = "fs", unix))]
-pub mod fs;
-#[cfg(feature = "safe-http")]
-pub mod safe_http;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 mod message;
@@ -17,8 +13,6 @@ mod message;
 mod model_limits;
 mod model;
 mod policy;
-#[cfg(all(feature = "process", unix))]
-pub mod process_control;
 pub mod providers;
 mod runtime;
 #[cfg(feature = "skills")]
