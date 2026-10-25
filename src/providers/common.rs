@@ -64,6 +64,50 @@ impl OpenAIClient {
         self.client = client;
     }
 
+    #[cfg(feature = "limits")]
+    pub(crate) fn http_client(&self) -> &Client {
+        &self.client
+    }
+
+    #[cfg(feature = "limits")]
+    pub(crate) fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
+    #[cfg(feature = "limits")]
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// POST `body` with a request-level total timeout and fail unless success.
+    /// The timeout covers connection, headers and the whole body.
+    pub(crate) async fn post_timed(
+        &self,
+        path: &str,
+        body: &Value,
+        timeout: Duration,
+    ) -> Result<reqwest::Response, ModelError> {
+        let response = self
+            .client
+            .post(format!("{}{path}", self.base_url))
+            .bearer_auth(&self.api_key)
+            .timeout(timeout)
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| ModelError::retryable(error.to_string()))?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        tracing::warn!(%status, model = %self.model, path, "OpenAI API request failed");
+        let body = response
+            .text()
+            .await
+            .map_err(|error| ModelError::retryable(error.to_string()))?;
+        Err(api_status_error(status, &body))
+    }
+
     /// POST `body` and fail with an API error unless the status is a success.
     async fn post(&self, path: &str, body: &Value) -> Result<reqwest::Response, ModelError> {
         let response = self

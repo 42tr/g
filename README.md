@@ -14,7 +14,11 @@
 - 支持 URL、data URL 和 OpenAI file ID 形式的图像输入
 - 支持最大工具调用数、超时和主动取消
 - 通过 `Model`、`Tool`、`Policy` 和 `EventSink` trait 扩展运行时
+- `OpenAIModel`（Responses API）内置每轮输入预算、工具参数校验与修复重生成、流式空闲超时与请求诊断日志
 - 可选 `mcp` / `skills` feature：每次请求显式传配置，支持运行时替换，无目录扫描；见 [使用说明](docs/extensions.md)
+- 可选 `limits` feature：`ModelBudget` 按模型服务元数据自动发现上下文窗口（含 SQLite 持久缓存，表可自建），`ContextModel` 提供滚动摘要式上下文压缩，`OpenAIModel::with_context_compaction()` 一键启用
+- 可选 `safe-http` feature：`safe_http` 模块提供防 SSRF、禁重定向、有界读取的模型工具 HTTP 请求
+- 可选 `process` feature：`process_control` 模块提供 Unix 进程组终止守卫，收尸后自动解除，避免 PGID 回绕误杀
 
 ## 环境要求
 
