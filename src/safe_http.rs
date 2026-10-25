@@ -9,7 +9,6 @@ use std::{collections::HashMap, sync::OnceLock, time::Duration};
 use anyhow::anyhow;
 use futures_util::StreamExt;
 use reqwest::dns::Resolve;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -17,25 +16,20 @@ use serde_json::{json, Value};
 pub const MAX_BODY_CHARS: usize = 16_000;
 const MAX_BODY_BYTES: usize = MAX_BODY_CHARS * 4 + 4;
 
-#[derive(Debug, Deserialize, JsonSchema)]
+/// The wire format of a tool request. Hosts derive their own JSON Schema for
+/// the model (schemars versions differ across hosts); this type only
+/// describes what execute accepts.
+#[derive(Debug, Deserialize)]
 pub struct Request {
     /// HTTP method; defaults to GET.
-    #[schemars(description = "HTTP 方法：GET、POST、PUT、PATCH、DELETE、HEAD，默认 GET")]
     pub method: Option<String>,
     /// Full HTTP(S) URL.
-    #[schemars(description = "完整请求 URL，仅支持 http/https")]
     pub url: String,
     /// Optional request headers.
-    #[schemars(description = "可选，请求头键值对，如 {\"Authorization\": \"Bearer xxx\"}")]
     pub headers: Option<HashMap<String, String>>,
     /// Optional request body.
-    #[schemars(description = "可选，请求体原文（如 JSON 字符串），仅 POST/PUT/PATCH 时有效")]
     pub body: Option<String>,
     /// Request timeout, clamped to one through 120 seconds.
-    #[schemars(
-        description = "可选，超时秒数，默认 30，最大 120",
-        range(min = 1, max = 120)
-    )]
     pub timeout_secs: Option<u64>,
 }
 
