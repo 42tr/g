@@ -1,6 +1,6 @@
 [package]
 name = "glow-agent"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 description = "A lightweight Rust agent runtime with streaming, tools, handoffs, and host-owned tasks"
 license = "MIT OR Apache-2.0"
