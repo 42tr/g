@@ -19,8 +19,8 @@ use crate::tool_arguments::{self, ArgumentError};
 
 const DEFAULT_MODEL: &str = "gpt-5.6";
 const PROVIDER_NAME: &str = "openai";
-/// Additional generations for a malformed tool batch, separate from transport retries.
-const MAX_ARGUMENT_REGENERATIONS: usize = 2;
+/// Additional model calls for a malformed tool batch; the original plus three repairs max.
+const MAX_ARGUMENT_REGENERATIONS: usize = 3;
 const MAX_ARGUMENT_LOG_BYTES: usize = 16 * 1024;
 /// Total budget for buffered (non-streaming) requests, headers included.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
@@ -981,11 +981,15 @@ mod repair_tests {
                 assert_eq!(body["tools"], requests[0]["tools"]);
                 assert!(body["instructions"].as_str().unwrap().contains("Include all required properties"));
             }
-            for (index, error) in [(1, "line 1 column"), (2, "参数路径 /calls")] {
+            for (index, error, rejected_arguments) in [
+                (1, "line 1 column", r#"{"calls": {"tool":"command","arguments":{}}]}"#),
+                (2, "参数路径 /calls", r#"{"calls": {"tool":"command","arguments":{}}}"#),
+            ] {
                 let input = requests[index]["input"].as_array().unwrap();
                 assert_eq!(input.len(), original_input.len() + 2);
                 let calls: Value = serde_json::from_str(input[original_input.len()]["content"].as_str().unwrap()).unwrap();
                 assert_eq!(calls["unexecuted_tool_calls"].as_array().unwrap().len(), 2);
+                assert_eq!(calls["unexecuted_tool_calls"][1]["arguments"], rejected_arguments);
                 let feedback = input.last().unwrap()["content"][0]["text"].as_str().unwrap();
                 assert!(feedback.contains(error), "{feedback}");
                 assert!(feedback.contains("No call in that batch was executed"));
@@ -995,17 +999,17 @@ mod repair_tests {
     }
 
     #[tokio::test]
-    async fn repeated_invalid_arguments_stop_after_two_regenerations() {
+    async fn repeated_invalid_arguments_stop_after_three_regenerations() {
         for stream in [false, true] {
-            let (model, requests, server) = server(vec![candidate("{", "partial"); 3]).await;
+            let (model, requests, server) = server(vec![candidate("{", "partial"); 4]).await;
             let sink = Deltas(Mutex::new(String::new()));
             let error = if stream { model.generate_stream(request(), &sink).await }
                 else { model.generate(request()).await }.unwrap_err();
             server.abort();
             assert!(!error.retryable);
-            assert!(error.message.contains("已重新生成 2 次"));
+            assert!(error.message.contains("已重新生成 3 次"));
             assert!(error.message.contains("run_tools"));
-            assert_eq!(requests.lock().unwrap().len(), 3);
+            assert_eq!(requests.lock().unwrap().len(), 4);
             if stream { assert_eq!(*sink.0.lock().unwrap(), "partial"); }
         }
     }
@@ -1130,13 +1134,13 @@ mod repair_tests {
                 candidate(r#"{"calls":[{"tool":"command","arguments":{}}]}}"#, "corrected"),
                 json!({"status":"completed","output":[{"type":"message",
                     "content":[{"type":"output_text","text":"done"}]}]})]
-            } else { vec![invalid; 3] };
+            } else { vec![invalid; 4] };
             let (model, requests, server) = server(replies).await;
             let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let agent = crate::Agent::new(Arc::new(model)).tool(CountTool(executions.clone()));
             let result = agent.run("Install the client").await;
             server.abort();
-            assert_eq!(requests.lock().unwrap().len(), 3);
+            assert_eq!(requests.lock().unwrap().len(), if succeeds { 3 } else { 4 });
             assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), if succeeds {2} else {0});
             if succeeds {
                 let output = result.unwrap();
@@ -1145,7 +1149,7 @@ mod repair_tests {
                 assert_eq!(output.usage.input_tokens, 20);
                 assert_eq!(output.messages.iter().filter(|message| message.role == Role::Assistant).count(), 2);
             } else {
-                assert!(result.unwrap_err().to_string().contains("已重新生成 2 次"));
+                assert!(result.unwrap_err().to_string().contains("已重新生成 3 次"));
             }
         }
     }
@@ -1210,11 +1214,11 @@ mod repair_tests {
     async fn an_ambiguous_missing_tool_name_still_exhausts_regenerations() {
         let shell = fixture_tool("shell", json!({"type":"object","properties":{"command":{"type":"string"}},
             "required":["command"],"additionalProperties":false}));
-        let replies = (0..3).map(|_| batch_reply(MISSING_TOOL_BATCH, "")).collect();
+        let replies = (0..4).map(|_| batch_reply(MISSING_TOOL_BATCH, "")).collect();
         let (model, requests, server) = server(replies).await;
         let error = model.generate(batch_request(batch_tools(vec![shell]))).await.unwrap_err().to_string();
-        assert!(error.contains("已重新生成 2 次"), "{error}");
-        assert_eq!(requests.lock().unwrap().len(), 3);
+        assert!(error.contains("已重新生成 3 次"), "{error}");
+        assert_eq!(requests.lock().unwrap().len(), 4);
         server.abort();
     }
 
@@ -1223,10 +1227,11 @@ mod repair_tests {
         let (model, requests, server) = server(vec![
             batch_reply("{}", "起步"),
             prose_reply("计划：第一步用 command 查看目录，第二步再读取结果。"),
-            prose_reply("已完成排查，无需工具调用。")]).await;
+            prose_reply("已完成排查，无需工具调用。"),
+            prose_reply("仍未提交工具调用。")]).await;
         let error = model.generate(batch_request(batch_tools(vec![]))).await.unwrap_err().to_string();
         assert!(error.contains("未提交任何工具调用"), "{error}");
-        assert_eq!(requests.lock().unwrap().len(), 3);
+        assert_eq!(requests.lock().unwrap().len(), 4);
         server.abort();
     }
 }
