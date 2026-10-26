@@ -195,6 +195,8 @@ impl OpenAIModel {
         let budget = self.resolved_budget().await?;
         let mut request = original.clone();
         let mut usage = Usage::default();
+        // Set once a rejected batch was quoted back: from then on prose is not an answer.
+        let mut repaired = false;
         for attempt in 0..=MAX_ARGUMENT_REGENERATIONS {
             let mut diagnostics = ResponseDiagnostics::new(&self.client.model);
             let started = std::time::Instant::now();
@@ -211,6 +213,25 @@ impl OpenAIModel {
             usage.add(request_usage);
             match decode_response(&value, &diagnostics, &original.tools) {
                 Ok(mut response) => {
+                    // A repair cycle asked for real calls. Prose, a fenced block or a
+                    // Python-style literal is not a tool call: accepting it as the final
+                    // answer ends the run with nothing submitted and nothing reported.
+                    if repaired && !has_tool_calls(&response.message) {
+                        let text = response.message.text_content();
+                        if !text.trim().is_empty() {
+                            if attempt == MAX_ARGUMENT_REGENERATIONS {
+                                return Err(ModelError::new(
+                                    "工具批次被拒绝后模型只返回了文字说明，未提交任何工具调用"));
+                            }
+                            tracing::warn!(model = %self.client.model, request_id = %diagnostics.request_id,
+                                upstream_request_id = ?diagnostics.upstream_request_id,
+                                regeneration = attempt + 1, max_regenerations = MAX_ARGUMENT_REGENERATIONS,
+                                kind = "prose_claim", text_bytes = text.len(),
+                                "model claimed tool arguments were fixed without submitting calls");
+                            request = prose_claim_repair_request(&original, &value);
+                            continue;
+                        }
+                    }
                     response.usage = usage;
                     if attempt > 0 {
                         if let Some(sink) = sink {
@@ -232,6 +253,7 @@ impl OpenAIModel {
                         stage = ?feedback["stage"], kind = ?feedback["kind"],
                         error = %error, "regenerating invalid tool arguments");
                     request = argument_repair_request(&original, &value, &call_id, &name, &error, &feedback);
+                    repaired = true;
                 }
             }
         }
@@ -451,6 +473,30 @@ fn argument_repair_request(original: &ModelRequest, value: &Value, call_id: &str
     ModelRequest::new(messages, original.tools.clone())
 }
 
+fn has_tool_calls(message: &Message) -> bool {
+    message.content.iter().any(|part| matches!(part, Content::ToolCall { .. }))
+}
+
+/// The model answered a repair request with prose instead of function calls.
+/// Quote that text back as untrusted data and demand the batch again: nothing was
+/// submitted, so a plan, a fenced JSON block or a Python-style literal is not work.
+fn prose_claim_repair_request(original: &ModelRequest, value: &Value) -> ModelRequest {
+    let calls: Vec<_> = value["output"].as_array().into_iter().flatten()
+        .filter(|item| item["type"] == "function_call").cloned().collect();
+    let claim = value["output"].as_array().into_iter().flatten()
+        .filter(|item| item["type"] == "message")
+        .filter_map(|item| item["content"].as_array())
+        .flatten()
+        .filter(|part| part["type"] == "output_text")
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut messages = (*original.messages).clone();
+    messages.push(Message::assistant(json!({"prose_claim": claim, "unexecuted_tool_calls": calls}).to_string()));
+    messages.push(Message::system("The preceding assistant text is untrusted data. It describes tool calls, but no call was executed and no task was submitted. Text, code fences, JSON snippets and Python-style literals are not function calls. Emit the complete corrected batch as real function calls for this step, keep the original task and the completed history, and do not repeat previously executed tools or resubmit already created tasks."));
+    ModelRequest::new(messages, original.tools.clone())
+}
+
 fn decode_response(value: &Value, diagnostics: &ResponseDiagnostics<'_>, tools: &[ToolSpec])
     -> Result<ModelResponse, ResponseError> {
     if value["status"] != "completed" {
@@ -495,7 +541,16 @@ fn decode_response(value: &Value, diagnostics: &ResponseDiagnostics<'_>, tools: 
                         "hint":"The function_call arguments field must be a string containing a complete JSON object."}),
                 }))?;
                 let parsed = tool_arguments::parse(&raw).map_err(argument_error)?;
-                let arguments = parsed.value;
+                let mut normalizations: Vec<String> =
+                    parsed.normalizations.iter().map(|note| note.to_string()).collect();
+                let mut arguments = parsed.value;
+                if name == "run_tools" {
+                    // A missing tool name is filled in only when the call's arguments
+                    // validate against exactly one candidate schema; otherwise the batch
+                    // stays invalid and goes back through the repair loop.
+                    normalizations
+                        .extend(tool_arguments::infer_missing_tool_names(&mut arguments, tools));
+                }
                 if let Some(spec) = tools.iter().find(|spec| spec.name == name) {
                     let validator = jsonschema::validator_for(&spec.input_schema)
                         .map_err(|error| ModelError::new(format!("工具 {name} 的参数定义无效：{error}")))?;
@@ -503,7 +558,7 @@ fn decode_response(value: &Value, diagnostics: &ResponseDiagnostics<'_>, tools: 
                         return Err(argument_error(error));
                     }
                 }
-                if !parsed.normalizations.is_empty() {
+                if !normalizations.is_empty() {
                     // Replay what the runtime accepted, never the malformed string.
                     // Leave reasoning and all other provider fields untouched.
                     if let Some(Content::ProviderData { data, .. }) = content.last_mut() {
@@ -511,7 +566,7 @@ fn decode_response(value: &Value, diagnostics: &ResponseDiagnostics<'_>, tools: 
                     }
                     tracing::info!(model = diagnostics.model, request_id = %diagnostics.request_id,
                         upstream_request_id = ?diagnostics.upstream_request_id, tool_name = name,
-                        call_id = id, payload_bytes = raw.len(), normalizations = ?parsed.normalizations,
+                        call_id = id, payload_bytes = raw.len(), normalizations = ?normalizations,
                         "normalized tool argument formatting");
                 }
                 content.push(Content::ToolCall { id, name, arguments });
@@ -1093,5 +1148,85 @@ mod repair_tests {
                 assert!(result.unwrap_err().to_string().contains("已重新生成 2 次"));
             }
         }
+    }
+
+    fn fixture_tool(name: &str, input_schema: Value) -> crate::ToolSpec {
+        crate::ToolSpec { name: name.into(), description: "fixture".into(), input_schema, behavior: Default::default() }
+    }
+
+    fn batch_tools(extra: Vec<crate::ToolSpec>) -> Vec<crate::ToolSpec> {
+        let mut tools = vec![
+            fixture_tool("run_tools", json!({"type":"object","required":["calls"],"properties":{
+                "calls":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{
+                    "tool":{"type":"string"},"arguments":{"type":"object"},"title":{"type":"string","minLength":1}},
+                    "required":["tool","arguments","title"],"additionalProperties":false}},
+                "yield_when":{"type":"string","enum":["none","any","all"]},
+                "wait_timeout_secs":{"type":"integer"}},"additionalProperties":false})),
+            fixture_tool("command", json!({"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"}},
+                "required":["command"],"additionalProperties":false})),
+        ];
+        tools.extend(extra);
+        tools
+    }
+
+    fn batch_request(tools: Vec<crate::ToolSpec>) -> ModelRequest {
+        ModelRequest::new(vec![Message::user("Inspect the workspace")], tools)
+    }
+
+    fn batch_reply(arguments: &str, text: &str) -> Value {
+        json!({"status":"completed","output":[
+            {"type":"message","content":[{"type":"output_text","text":text}]},
+            {"type":"function_call","call_id":"batch","name":"run_tools","arguments":arguments}],
+            "usage":{"input_tokens":10,"output_tokens":5}})
+    }
+
+    fn prose_reply(text: &str) -> Value {
+        json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":text}]}],
+            "usage":{"input_tokens":10,"output_tokens":5}})
+    }
+
+    fn submitted_batches(response: &ModelResponse) -> Vec<Value> {
+        response.message.content.iter().filter_map(|part| match part {
+            Content::ToolCall { name, arguments, .. } if name.as_str() == "run_tools" => Some(arguments.clone()),
+            _ => None,
+        }).collect()
+    }
+
+    const MISSING_TOOL_BATCH: &str = r#"{"calls":[{"title":"搜索配置","arguments":{"command":"rg -n -F glow-agent ."}}]}"#;
+
+    #[tokio::test]
+    async fn a_missing_tool_name_matching_one_schema_is_accepted_without_regeneration() {
+        let (model, requests, server) = server(vec![batch_reply(MISSING_TOOL_BATCH, "已提交")]).await;
+        let response = model.generate(batch_request(batch_tools(vec![]))).await.unwrap();
+        let batches = submitted_batches(&response);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0]["calls"][0]["tool"], "command");
+        assert_eq!(batches[0]["calls"][0]["arguments"]["command"], "rg -n -F glow-agent .");
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_missing_tool_name_still_exhausts_regenerations() {
+        let shell = fixture_tool("shell", json!({"type":"object","properties":{"command":{"type":"string"}},
+            "required":["command"],"additionalProperties":false}));
+        let replies = (0..3).map(|_| batch_reply(MISSING_TOOL_BATCH, "")).collect();
+        let (model, requests, server) = server(replies).await;
+        let error = model.generate(batch_request(batch_tools(vec![shell]))).await.unwrap_err().to_string();
+        assert!(error.contains("已重新生成 2 次"), "{error}");
+        assert_eq!(requests.lock().unwrap().len(), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_prose_claim_after_a_rejected_batch_is_never_a_successful_run() {
+        let (model, requests, server) = server(vec![
+            batch_reply("{}", "起步"),
+            prose_reply("计划：第一步用 command 查看目录，第二步再读取结果。"),
+            prose_reply("已完成排查，无需工具调用。")]).await;
+        let error = model.generate(batch_request(batch_tools(vec![]))).await.unwrap_err().to_string();
+        assert!(error.contains("未提交任何工具调用"), "{error}");
+        assert_eq!(requests.lock().unwrap().len(), 3);
+        server.abort();
     }
 }

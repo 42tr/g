@@ -1,6 +1,12 @@
 //! Tool arguments are executable input. Normalize wrappers only; never guess values
 //! or repair strings, escapes, missing delimiters, or an incomplete JSON document.
+//! A tool name that a run_tools call omitted is the one exception: it is filled in only
+//! when the call's arguments validate against exactly one candidate schema.
+use std::collections::HashMap;
+
 use serde_json::{json, Value};
+
+use crate::ToolSpec;
 
 const MAX_EXTRA_CLOSERS: usize = 8;
 const MAX_SCHEMA_ERRORS: usize = 8;
@@ -91,6 +97,49 @@ pub(crate) fn schema_error(validator: &jsonschema::Validator, arguments: &Value)
     })
 }
 
+/// Fill in a `tool` name the model omitted, but only when the call's `arguments`
+/// validate against exactly one candidate schema. The name comes from the same
+/// schemas used for validation, never from key names or string heuristics;
+/// ambiguous or unmatched batches stay invalid and go back through the repair loop.
+pub(crate) fn infer_missing_tool_names(value: &mut Value, candidates: &[ToolSpec]) -> Vec<String> {
+    let Some(calls) = value.get_mut("calls").and_then(Value::as_array_mut) else {
+        return Vec::new();
+    };
+    // Task controls cannot be nested inside a batch, so they are never candidates.
+    let usable: Vec<&ToolSpec> = candidates
+        .iter()
+        .filter(|spec| !crate::task::is_task_control(&spec.name))
+        .collect();
+    let mut validators: HashMap<&str, Option<jsonschema::Validator>> = HashMap::new();
+    let mut inferred = Vec::new();
+    for (index, call) in calls.iter_mut().enumerate() {
+        let Some(call) = call.as_object_mut() else { continue };
+        if call.get("tool").and_then(Value::as_str).is_some_and(|name| !name.trim().is_empty()) {
+            continue;
+        }
+        let Some(arguments) = call.get("arguments").filter(|value| value.is_object()).cloned() else {
+            continue;
+        };
+        let mut matches = Vec::new();
+        for spec in &usable {
+            let accepts = validators
+                .entry(spec.name.as_str())
+                .or_insert_with(|| jsonschema::validator_for(&spec.input_schema).ok())
+                .as_ref()
+                .is_some_and(|validator| validator.validate(&arguments).is_ok());
+            if accepts {
+                matches.push(spec.name.as_str());
+            }
+        }
+        if let [name] = matches[..] {
+            tracing::info!(tool_name = name, call_index = index, "inferred missing task tool from schema");
+            call.insert("tool".into(), Value::String(name.to_string()));
+            inferred.push(format!("inferred_missing_tool:{name}"));
+        }
+    }
+    inferred
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +195,54 @@ mod tests {
         assert!(!feedback.contains("DO_NOT_LOG"));
         assert!(!error.message.contains("DO_NOT_LOG"));
         assert!(schema_error(&validator, &json!({"calls":[{"tool":"command","title":"运行检查"}]})).is_none());
+    }
+
+    fn fixture_tool(name: &str, input_schema: Value) -> ToolSpec {
+        ToolSpec { name: name.into(), description: "fixture".into(), input_schema, behavior: Default::default() }
+    }
+
+    fn command_schema() -> Value {
+        json!({"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"}},
+            "required":["command"],"additionalProperties":false})
+    }
+
+    fn fixture_candidates() -> Vec<ToolSpec> {
+        vec![
+            fixture_tool("run_tools", json!({"type":"object"})),
+            fixture_tool("command", command_schema()),
+            fixture_tool("get_tasks", json!({"type":"object","properties":{"task_ids":{"type":"array","items":{"type":"string"}}},
+                "required":["task_ids"],"additionalProperties":false})),
+        ]
+    }
+
+    #[test]
+    fn a_missing_tool_name_is_inferred_only_from_exactly_one_matching_schema() {
+        let mut batch = json!({"calls":[{"title":"运行检查","arguments":{"command":"echo hi"}}]});
+        assert_eq!(infer_missing_tool_names(&mut batch, &fixture_candidates()), vec!["inferred_missing_tool:command"]);
+        assert_eq!(batch["calls"][0]["tool"], "command");
+        let validator = jsonschema::validator_for(&json!({"type":"object","properties":{"calls":{"type":"array",
+            "items":{"type":"object","properties":{"tool":{"type":"string"},"arguments":{"type":"object"}},
+            "required":["tool","arguments"]}}},"required":["calls"]})).unwrap();
+        assert!(schema_error(&validator, &batch).is_none());
+    }
+
+    #[test]
+    fn ambiguous_unmatched_absent_or_present_calls_are_never_inferred() {
+        let expected = json!({"calls":[{"title":"运行检查","arguments":{"command":"echo hi"}}]});
+        let mut ambiguous = expected.clone();
+        let mut many = fixture_candidates();
+        many.push(fixture_tool("shell", command_schema()));
+        assert!(infer_missing_tool_names(&mut ambiguous, &many).is_empty());
+        assert_eq!(ambiguous, expected);
+        let expected = json!({"calls":[{"title":"运行检查","arguments":{}},{"title":"运行检查"},
+            {"title":"运行检查","arguments":"echo"},
+            {"tool":"command","title":"运行检查","arguments":{"command":"echo hi"}}]});
+        let mut batch = expected.clone();
+        assert!(infer_missing_tool_names(&mut batch, &fixture_candidates()).is_empty());
+        assert_eq!(batch, expected);
+        let expected = json!({"calls":[{"title":"取结果","arguments":{"task_ids":["a"]}}]});
+        let mut control = expected.clone();
+        assert!(infer_missing_tool_names(&mut control, &fixture_candidates()).is_empty());
+        assert_eq!(control, expected);
     }
 }
