@@ -69,7 +69,7 @@ tokio = { version = "1", features = ["macros", "rt"] }
 
 ```toml
 [dependencies]
-glow-agent = "0.1.0"
+glow-agent = "0.3.3"
 ```
 
 本仓库包含 `glow-agent` 运行时和 `glow-agent-macros` 过程宏两个包。
@@ -81,7 +81,7 @@ glow-agent = "0.1.0"
 
 ```toml
 [dependencies]
-g = { package = "glow-agent", version = "0.1.0" }
+g = { package = "glow-agent", version = "0.3.3" }
 ```
 
 Git 依赖或本地 `path` 依赖同样可以保留 `g` 别名，但也需要指定
