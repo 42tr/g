@@ -129,10 +129,8 @@ async fn handoff_binds_only_the_childs_explicit_backend() {
     let worker_model = model(vec![
         call(
             "batch",
-            "run_tools",
-            json!({
-                "calls":[{"tool":"lookup","arguments":{"id":1},"title":"查询记录 1"}], "yield_when":"none"
-            }),
+            "lookup",
+            json!({"id":1}),
         ),
         Message::assistant("checked"),
     ]);
@@ -156,12 +154,10 @@ async fn handoff_binds_only_the_childs_explicit_backend() {
     assert_eq!(scoped.submitted.load(Ordering::SeqCst), 1);
     assert_eq!(scoped.acknowledged.load(Ordering::SeqCst), 1);
     assert_eq!(parent_backend.submitted.load(Ordering::SeqCst), 0);
-    assert!(
-        worker_model.requests.lock().unwrap()[0]
-            .tools
-            .iter()
-            .any(|tool| tool.name == "run_tools")
-    );
+    assert!(!worker_model.requests.lock().unwrap()[0]
+        .tools
+        .iter()
+        .any(|tool| tool.name == "run_tools"));
     assert!(
         !plain_model.requests.lock().unwrap()[0]
             .tools

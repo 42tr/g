@@ -323,6 +323,7 @@ async fn guarded<T>(
     }
 }
 
+#[derive(Clone)]
 struct ToolCall {
     id: String,
     name: String,
@@ -552,6 +553,19 @@ impl RunContext<'_> {
                 self.emit_tool_result(&call, result, true, messages).await;
                 continue;
             };
+            if self.agent.task_backend.is_some() {
+                let mut batch = vec![(call, tool.clone())];
+                while let Some(next) = calls.next_if(|next| {
+                    !crate::task::is_task_control(&next.name)
+                        && self.agent.handoff_by_tool_name(&next.name).is_none()
+                        && self.agent.tools.contains_key(&next.name)
+                }) {
+                    let tool = self.agent.tools[&next.name].clone();
+                    batch.push((next, tool));
+                }
+                self.execute_direct_tasks(batch, messages).await?;
+                continue;
+            }
             let parallel = self.is_parallel_tool(&call.name);
             let mut batch = vec![(call, tool.clone())];
             if parallel {
@@ -570,7 +584,13 @@ impl RunContext<'_> {
         call: &ToolCall,
     ) -> Result<Result<Value, crate::ToolError>, AgentError> {
         let backend = self.agent.task_backend.as_ref().expect("task backend");
-        let spec = self.spec(&call.name).expect("task control spec");
+        let legacy_spec;
+        let spec = if call.name == "run_tools" {
+            legacy_spec = crate::task::legacy_run_tools_spec();
+            &legacy_spec
+        } else {
+            self.spec(&call.name).expect("task control spec")
+        };
         if let Some(result) = self
             .authorize(spec, &call.arguments, &ToolOrigin::Local)
             .await?
@@ -654,6 +674,120 @@ impl RunContext<'_> {
             "wait_timeout_secs":call.arguments["wait_timeout_secs"].as_u64().unwrap_or(30)}),
             )
             .await)
+    }
+
+    async fn execute_direct_tasks(
+        &self,
+        batch: Vec<(ToolCall, Arc<dyn Tool>)>,
+        messages: &mut Vec<Message>,
+    ) -> Result<(), AgentError> {
+        let backend = self.agent.task_backend.as_ref().expect("task backend");
+        let all_calls = batch.clone();
+        let mut results = vec![None; batch.len()];
+        let mut pending = Vec::new();
+        let mut acknowledgement = None;
+        for (index, (call, tool)) in batch.into_iter().enumerate() {
+            let spec = self.spec(&call.name).expect("registered tool spec");
+            if let Some(result) = self.authorize(spec, &call.arguments, &tool.origin()).await? {
+                results[index] = Some((result, true));
+                continue;
+            }
+            let validator = jsonschema::validator_for(&spec.input_schema)
+                .map_err(|e| crate::extensions::invalid(e.to_string()))?;
+            if let Err(error) = validator.validate(&call.arguments) {
+                results[index] = Some((json!({"error": error.to_string()}), true));
+                continue;
+            }
+            self.emit(RunEvent::ToolStarted {
+                run_id: self.run_id,
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+            })
+            .await;
+            pending.push((index, call, tool));
+        }
+
+        if !pending.is_empty() {
+            let submissions = pending
+                .iter()
+                .map(|(index, call, tool)| crate::TaskSubmission {
+                    run_id: self.run_id,
+                    call_id: call.id.clone(),
+                    index: *index,
+                    request: crate::TaskCall {
+                        tool: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                        title: None,
+                        parent_task_id: None,
+                        execution_timeout_secs: None,
+                    },
+                    tool: tool.clone(),
+                })
+                .collect();
+            match backend.submit(submissions).await {
+                Ok(ids) => {
+                    // shortcut: direct calls wait 30s; use wait_tools for longer tasks.
+                    let snapshot = backend
+                        .control(
+                            "wait_tools",
+                            json!({"task_ids":ids,"yield_when":"all","wait_timeout_secs":30}),
+                        )
+                        .await;
+                    match snapshot {
+                        Ok(snapshot) => {
+                            for ((index, _, _), task_id) in pending.iter().zip(ids.iter()) {
+                                let entry = ["completed", "pending"]
+                                    .iter()
+                                    .find_map(|key| {
+                                        snapshot[*key]
+                                            .as_array()?
+                                            .iter()
+                                            .find(|task| {
+                                                task["id"].as_str() == Some(task_id.as_str())
+                                                    || task["task_id"].as_str() == Some(task_id.as_str())
+                                            })
+                                            .cloned()
+                                    })
+                                    .unwrap_or_else(|| snapshot.clone());
+                                results[*index] = Some((entry, false));
+                            }
+                            acknowledgement = Some(snapshot);
+                        }
+                        Err(error) => {
+                            for (index, _, _) in &pending {
+                                results[*index] = Some((json!({"error": error.message.clone()}), true));
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    for (index, _, _) in &pending {
+                        results[*index] = Some((json!({"error": error.message.clone()}), true));
+                    }
+                }
+            }
+        }
+        for (index, _, _) in &pending {
+            if results[*index].is_none() {
+                results[*index] = Some((
+                    json!({"error":"task backend returned an incomplete submission result"}),
+                    true,
+                ));
+            }
+        }
+
+        for (index, (call, _)) in all_calls.into_iter().enumerate() {
+            if let Some((value, is_error)) = results[index].take() {
+                self.emit_tool_result(&call, value, is_error, messages).await;
+            }
+        }
+        if let Some(snapshot) = acknowledgement {
+            backend
+                .acknowledge(&snapshot)
+                .await
+                .map_err(|e| crate::extensions::invalid(&e.message))?;
+        }
+        Ok(())
     }
 
     async fn execute_tools(

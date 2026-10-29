@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use uuid::Uuid;
 
-pub const TASK_INSTRUCTION: &str = "\nTask execution: use run_tools to start independent tools concurrently. Every call must include a concise, human-readable title in the user's language, describing the action and its target (for example, 检查 RDP 会话状态 or 运行项目测试 for Chinese conversations). Titles appear in the execution workflow; never use only a tool name or a raw shell command. Its response may contain pending task IDs. Use wait_tools to receive results (timeouts only end the wait). Use get_tasks with specific task_ids when progress or output is needed; an empty query is only a bounded overview of tasks needing attention. Do not reread completed history unless it is relevant to the user's request. Never claim a pending task succeeded. Before finishing, receive required results and detach or cancel remaining attached tasks. Preserve already detached work; do not cancel a background session needed for user confirmation just to clean up. command runs noninteractive CLI programs. Do not repeatedly poll without waiting. Parent task IDs denote actual subtasks, not mere dependencies.\n";
+pub const TASK_INSTRUCTION: &str = "\nTask execution: call the registered tool directly with its typed arguments. Independent tool calls in one response may run concurrently. Results can contain pending task IDs; use wait_tools to receive results, and get_tasks with specific task_ids when progress or output is needed. Do not reread completed history unless it is relevant to the user's request. Never claim a pending task succeeded. Before finishing, receive required results and detach or cancel remaining attached tasks. command runs noninteractive CLI programs. Do not repeatedly poll without waiting. Parent task IDs denote actual subtasks, not mere dependencies.\n";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -66,14 +66,6 @@ pub(crate) fn task_specs() -> Vec<ToolSpec> {
     let ids = json!({"type":"array","items":{"type":"string"},"maxItems":64});
     let wait = json!({"type":"integer","minimum":0,"maximum":604800});
     [
-        ("run_tools", "Submit tools as host-owned tasks. Wait for any/all result or return immediately. Each actual call counts against the tool budget.", json!({
-            "type":"object", "properties": {
-                "calls":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{
-                    "tool":{"type":"string"},"arguments":{"type":"object"},"title":{"type":"string","minLength":1,"maxLength":200,"pattern":"\\S","description":"Required workflow title in the user's language: a concise action and target, such as 检查 RDP 会话状态. Do not use just the tool name or a raw shell command."},
-                    "parent_task_id":{"type":"string"},"execution_timeout_secs":{"type":"integer","minimum":1}
-                },"required":["tool","arguments","title"],"additionalProperties":false}},
-                "yield_when":{"type":"string","enum":["none","any","all"]},"wait_timeout_secs":wait
-            },"required":["calls"],"additionalProperties":false})),
         ("wait_tools", "Receive task results; waiting does not cancel tasks. Defaults to any result, 30 seconds.", json!({"type":"object","properties":{
             "task_ids":ids,"yield_when":{"type":"string","enum":["any","all"]},"wait_timeout_secs":wait
         },"required":["task_ids"],"additionalProperties":false})),
@@ -88,4 +80,24 @@ pub(crate) fn task_specs() -> Vec<ToolSpec> {
     ].into_iter().map(|(name, description, input_schema)| ToolSpec {
         name:name.into(), description:description.into(), input_schema, behavior:ToolBehavior::default(),
     }).collect()
+}
+
+/// Kept for old conversations that still contain a run_tools call. New model
+/// requests do not advertise this wrapper; direct calls use the registered
+/// tool schema instead.
+pub(crate) fn legacy_run_tools_spec() -> ToolSpec {
+    ToolSpec {
+        name: "run_tools".into(),
+        description: "Legacy task wrapper; use direct tool calls instead.".into(),
+        input_schema: json!({
+            "type":"object", "properties": {
+                "calls":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{
+                    "tool":{"type":"string"},"arguments":{"type":"object"},"title":{"type":"string","minLength":1,"maxLength":200,"pattern":"\\S"},
+                    "parent_task_id":{"type":"string"},"execution_timeout_secs":{"type":"integer","minimum":1}
+                },"required":["tool","arguments","title"],"additionalProperties":false}},
+                "yield_when":{"type":"string","enum":["none","any","all"]},"wait_timeout_secs":{"type":"integer","minimum":0,"maximum":604800}
+            },"required":["calls"],"additionalProperties":false
+        }),
+        behavior: ToolBehavior::default(),
+    }
 }

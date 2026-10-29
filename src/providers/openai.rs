@@ -29,7 +29,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const STREAM_TOTAL_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 /// No SSE event (including heartbeats) within this window means the stream stalled.
 const STREAM_EVENT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-const TOOL_ARGUMENT_INSTRUCTIONS: &str = "Every function call's arguments must encode exactly one JSON object conforming to its tool schema. Include all required properties, even if older calls in the history omitted them. Do not add code fences or text outside the object. Escape string values exactly once. For run_tools, each call needs tool, arguments and a descriptive title in the user's language. Never guess missing executable arguments.";
+const TOOL_ARGUMENT_INSTRUCTIONS: &str = "Every function call's arguments must encode exactly one JSON object conforming to its tool schema. Include all required properties, even if older calls in the history omitted them. Do not add code fences or text outside the object. Escape string values exactly once. Call registered tools directly with their typed arguments; legacy run_tools calls must include tool, arguments and a descriptive title in the user's language. Never guess missing executable arguments.";
 
 #[derive(Debug)]
 enum ResponseError {
