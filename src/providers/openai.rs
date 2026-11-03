@@ -102,6 +102,7 @@ fn tool_arguments_excerpt(raw: &str) -> (String, bool) {
 pub struct OpenAIModel {
     client: OpenAIClient,
     context_budget: Option<usize>,
+    reasoning_effort: Option<String>,
     #[cfg(feature = "limits")]
     limits_pool: Option<sqlx::SqlitePool>,
 }
@@ -111,6 +112,7 @@ impl OpenAIModel {
         Self {
             client: OpenAIClient::new(api_key.into(), model.into()),
             context_budget: None,
+            reasoning_effort: None,
             #[cfg(feature = "limits")]
             limits_pool: None,
         }
@@ -120,6 +122,7 @@ impl OpenAIModel {
         Ok(Self {
             client: OpenAIClient::from_env(DEFAULT_MODEL)?,
             context_budget: None,
+            reasoning_effort: None,
             #[cfg(feature = "limits")]
             limits_pool: None,
         })
@@ -127,6 +130,12 @@ impl OpenAIModel {
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.client.set_base_url(base_url.into());
+        self
+    }
+
+    /// Configure a provider-advertised Responses effort. None uses its default.
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort.filter(|value| !value.is_empty());
         self
     }
 
@@ -317,6 +326,9 @@ impl OpenAIModel {
             "include": ["reasoning.encrypted_content"],
             "stream": stream
         });
+        if let Some(effort) = &self.reasoning_effort {
+            body["reasoning"] = json!({"effort":effort});
+        }
         // Some compatible servers reject an empty `tools` array.
         if !request.tools.is_empty() {
             body["tools"] = request.tools.iter().map(tool_to_api).collect();
@@ -767,6 +779,28 @@ mod tests {
             .unwrap();
         assert!(body["instructions"].as_str().unwrap().contains("Include all required properties"));
         assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sends_the_configured_reasoning_effort_only_when_set() {
+        let request = || ModelRequest::new(vec![Message::user("hi")], Vec::new());
+        let body = OpenAIModel::new("key", "model")
+            .request_body(&request(), false, None)
+            .unwrap();
+        assert!(body.get("reasoning").is_none());
+
+        let body = OpenAIModel::new("key", "model")
+            .with_reasoning_effort(Some("high".into()))
+            .request_body(&request(), false, None)
+            .unwrap();
+        assert_eq!(body["reasoning"], json!({"effort":"high"}));
+
+        // An empty configured value keeps the provider default instead of sending "".
+        let body = OpenAIModel::new("key", "model")
+            .with_reasoning_effort(Some(String::new()))
+            .request_body(&request(), false, None)
+            .unwrap();
+        assert!(body.get("reasoning").is_none());
     }
 
     #[test]
